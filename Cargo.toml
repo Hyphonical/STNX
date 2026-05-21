@@ -41,4 +41,4 @@ strip         = true
 panic         = "abort"
 
 [build-dependencies]
-prost-build = "0.14.3"
+prost-build = { version = "0.14.3", features = ["protoc-prebuilt"] }
