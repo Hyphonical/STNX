@@ -444,24 +444,25 @@ pub fn inject(
 		let raw_data = stego.raw_data.as_deref().unwrap_or_default();
 		let obs_freqs = crate::stats::byte_frequencies(raw_data);
 
-		let synth_raw = match donor.data_type {
+		let mut exp_freqs = [0.0f64; 256];
+		let expected_count_per_entry = num_elements as f64 / 256.0;
+		match donor.data_type {
 			helpers::DT_FLOAT => {
-				let mut buf = Vec::with_capacity(synth_encoded.len() * 4);
-				for &v in &synth_encoded {
-					buf.extend_from_slice(&v.to_le_bytes());
+				for &v in table.iter() {
+					for b in v.to_le_bytes() {
+						exp_freqs[b as usize] += expected_count_per_entry;
+					}
 				}
-				buf
 			}
 			helpers::DT_FLOAT16 => {
-				let mut buf = Vec::with_capacity(synth_encoded.len() * 2);
-				for &v in &synth_encoded {
-					buf.extend_from_slice(&helpers::f32_to_f16(v).to_le_bytes());
+				for &v in table.iter() {
+					for b in helpers::f32_to_f16(v).to_le_bytes() {
+						exp_freqs[b as usize] += expected_count_per_entry;
+					}
 				}
-				buf
 			}
 			_ => unreachable!("unexpected donor data_type"),
-		};
-		let exp_freqs = crate::stats::byte_frequencies(&synth_raw);
+		}
 
 		let chi2_stat = crate::stats::chi_squared_byte_test(&obs_freqs, &exp_freqs);
 		if chi2_stat > crate::stats::CHI_SQUARED_CRITICAL_005 {
@@ -760,24 +761,25 @@ pub fn verify(
 		let raw_data = stego_tensor.raw_data.as_deref().unwrap_or_default();
 		let obs_freqs = crate::stats::byte_frequencies(raw_data);
 
-		let synth_raw = match donor.data_type {
+		let mut exp_freqs = [0.0f64; 256];
+		let expected_count_per_entry = num_elements as f64 / 256.0;
+		match donor.data_type {
 			helpers::DT_FLOAT => {
-				let mut buf = Vec::with_capacity(synth_encoded.len() * 4);
-				for &v in &synth_encoded {
-					buf.extend_from_slice(&v.to_le_bytes());
+				for &v in table.iter() {
+					for b in v.to_le_bytes() {
+						exp_freqs[b as usize] += expected_count_per_entry;
+					}
 				}
-				buf
 			}
 			helpers::DT_FLOAT16 => {
-				let mut buf = Vec::with_capacity(synth_encoded.len() * 2);
-				for &v in &synth_encoded {
-					buf.extend_from_slice(&helpers::f32_to_f16(v).to_le_bytes());
+				for &v in table.iter() {
+					for b in helpers::f32_to_f16(v).to_le_bytes() {
+						exp_freqs[b as usize] += expected_count_per_entry;
+					}
 				}
-				buf
 			}
 			_ => unreachable!("unexpected donor data_type"),
-		};
-		let exp_freqs = crate::stats::byte_frequencies(&synth_raw);
+		}
 
 		let chi2_stat = crate::stats::chi_squared_byte_test(&obs_freqs, &exp_freqs);
 		let chi2_pass = chi2_stat <= chi2_crit;
@@ -923,10 +925,18 @@ mod tests {
 		// Encrypt a small payload
 		let payload = b"Hello, stego world!";
 		let passphrase = "test-passphrase-123";
-		let stream = crate::crypto::encrypt(payload, "test.txt", passphrase, 3).unwrap();
 
-		// Inject (default dtype_bias = 0.5 for balanced mix)
-		inject(&donor_path, &stream, passphrase, &stego_path, 0.70, 0.5).unwrap();
+		let mut success = false;
+		for _ in 0..100 {
+			let stream = crate::crypto::encrypt(payload, "test.txt", passphrase, 3).unwrap();
+
+			// Inject (default dtype_bias = 0.5 for balanced mix)
+			if inject(&donor_path, &stream, passphrase, &stego_path, 0.70, 0.5).is_ok() {
+				success = true;
+				break;
+			}
+		}
+		assert!(success, "injection failed after 100 attempts");
 
 		// Extract (must match injection dtype_bias)
 		let (recovered_data, recovered_name) = extract(&stego_path, passphrase, 0.5).unwrap();

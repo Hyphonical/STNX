@@ -271,7 +271,7 @@ pub fn ks_test_passes(sample_a: &[f64], sample_b: &[f64]) -> bool {
 ///
 /// Panics if `obs` and `exp` have different lengths or if any expected
 /// frequency is zero.
-pub fn chi_squared_byte_test(obs: &[u64], exp: &[u64]) -> f64 {
+pub fn chi_squared_byte_test(obs: &[u64], exp: &[f64]) -> f64 {
 	assert_eq!(
 		obs.len(),
 		exp.len(),
@@ -286,7 +286,7 @@ pub fn chi_squared_byte_test(obs: &[u64], exp: &[u64]) -> f64 {
 	let mut statistic = 0.0f64;
 	for i in 0..256 {
 		let o = obs[i] as f64;
-		let e = exp[i] as f64;
+		let e = exp[i];
 		if e <= 0.0 {
 			// If expected frequency is zero, the observed must also be zero —
 			// otherwise the test fails trivially.
@@ -323,7 +323,7 @@ pub const CHI_SQUARED_CRITICAL_005: f64 = 293.247_835;
 ///
 /// Returns `true` if the null hypothesis (same byte distribution) is **not**
 /// rejected.
-pub fn chi_squared_test_passes(obs: &[u64], exp: &[u64]) -> bool {
+pub fn chi_squared_test_passes(obs: &[u64], exp: &[f64]) -> bool {
 	let statistic = chi_squared_byte_test(obs, exp);
 	statistic <= CHI_SQUARED_CRITICAL_005
 }
@@ -555,10 +555,10 @@ mod tests {
 	#[test]
 	fn test_chi_squared_identical() {
 		let mut obs = [0u64; 256];
-		let mut exp = [0u64; 256];
+		let mut exp = [0.0f64; 256];
 		for i in 0..256 {
 			obs[i] = 100;
-			exp[i] = 100;
+			exp[i] = 100.0;
 		}
 		let stat = chi_squared_byte_test(&obs, &exp);
 		assert!(
@@ -570,12 +570,12 @@ mod tests {
 	#[test]
 	fn test_chi_squared_different() {
 		let mut obs = [0u64; 256];
-		let mut exp = [0u64; 256];
+		let mut exp = [0.0f64; 256];
 		obs[0] = 1000;
-		exp[0] = 100;
+		exp[0] = 100.0;
 		for i in 1..256 {
 			obs[i] = 100;
-			exp[i] = 100;
+			exp[i] = 100.0;
 		}
 		let stat = chi_squared_byte_test(&obs, &exp);
 		assert!(
@@ -600,10 +600,10 @@ mod tests {
 	#[test]
 	fn test_chi_squared_passes_identical() {
 		let mut obs = [0u64; 256];
-		let mut exp = [0u64; 256];
+		let mut exp = [0.0f64; 256];
 		for i in 0..256 {
 			obs[i] = 100;
-			exp[i] = 100;
+			exp[i] = 100.0;
 		}
 		assert!(chi_squared_test_passes(&obs, &exp));
 	}
@@ -611,10 +611,10 @@ mod tests {
 	#[test]
 	fn test_chi_squared_rejects_extreme() {
 		let mut obs = [0u64; 256];
-		let mut exp = [0u64; 256];
+		let mut exp = [0.0f64; 256];
 		for i in 0..256 {
 			obs[i] = if i == 0 { 100_000 } else { 100 };
-			exp[i] = 100;
+			exp[i] = 100.0;
 		}
 		assert!(!chi_squared_test_passes(&obs, &exp));
 	}

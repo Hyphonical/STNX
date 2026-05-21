@@ -50,39 +50,60 @@ fn main() {
 				.and_then(|s| s.to_str())
 				.unwrap_or("payload");
 
-			// Encrypt payload → assembled stream
-			let stream = match crypto::encrypt(&payload_bytes, filename, &passphrase, zstd_level) {
-				Ok(s) => s,
-				Err(e) => {
-					eprintln!("{} Encryption failed: {e}", "✗".red().bold());
-					return;
-				}
-			};
-
-			eprintln!(
-				"{} {} B → {} B encrypted stream",
-				"…".cyan(),
-				payload_bytes.len().to_string().white(),
-				stream.len().to_string().white()
-			);
-
-			eprintln!("{} Injecting into {} …", "…".cyan(), model.display().cyan());
-
 			let out_path = out.unwrap_or_else(|| model.with_extension("stego.onnx"));
+			let mut success = false;
 
-			match stego::inject(&model, &stream, &passphrase, &out_path, alpha, dtype_bias) {
-				Ok(()) => {
-					println!(
-						"{} {}  ({} B payload → {} B stream)",
-						"✓".green().bold(),
-						out_path.display().cyan(),
+			for attempt in 1..=50 {
+				// Encrypt payload → assembled stream
+				let stream =
+					match crypto::encrypt(&payload_bytes, filename, &passphrase, zstd_level) {
+						Ok(s) => s,
+						Err(e) => {
+							eprintln!("{} Encryption failed: {e}", "✗".red().bold());
+							return;
+						}
+					};
+
+				if attempt == 1 {
+					eprintln!(
+						"{} {} B → {} B encrypted stream",
+						"…".cyan(),
 						payload_bytes.len().to_string().white(),
 						stream.len().to_string().white()
 					);
+					eprintln!("{} Injecting into {} …", "…".cyan(), model.display().cyan());
 				}
-				Err(e) => {
-					eprintln!("{} Injection failed: {e}", "✗".red().bold());
+
+				match stego::inject(&model, &stream, &passphrase, &out_path, alpha, dtype_bias) {
+					Ok(()) => {
+						println!(
+							"{} {}  ({} B payload → {} B stream){}",
+							"✓".green().bold(),
+							out_path.display().cyan(),
+							payload_bytes.len().to_string().white(),
+							stream.len().to_string().white(),
+							if attempt > 1 {
+								format!(" (took {} attempts)", attempt)
+							} else {
+								"".to_string()
+							}
+						);
+						success = true;
+						break;
+					}
+					Err(e) => {
+						if attempt == 50 {
+							eprintln!(
+								"{} Injection failed after 50 attempts: {e}",
+								"✗".red().bold()
+							);
+						}
+					}
 				}
+			}
+
+			if !success {
+				std::process::exit(1);
 			}
 		}
 		Commands::Extract {
