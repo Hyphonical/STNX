@@ -174,6 +174,63 @@ impl DonorSelector {
 		}
 		(self.next_u32() as usize) % pool_size
 	}
+
+	/// Consume one raw u32 from the CSPRNG without applying a modulus.
+	///
+	/// Used by biased donor selection to consume a predictable number of
+	/// CSPRNG outputs regardless of pool composition.
+	pub(crate) fn next_raw_u32(&mut self) -> u32 {
+		self.next_u32()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Biased donor selection  (dtype_bias flag)
+// ---------------------------------------------------------------------------
+
+/// Select a donor tensor from the eligible pool with dtype bias control.
+///
+/// `dtype_bias` is a float in [0.0, 1.0]:
+/// - 0.0 → always select FP16 donors (stego tensors are FP16)
+/// - 1.0 → always select FP32 donors (stego tensors are FP32)
+/// - 0.5 → equal chance of FP16 vs FP32 (balanced mix)
+///
+/// Each call consumes exactly 2 raw u32s from the CSPRNG (one for the pool
+/// decision, one for the index within the chosen pool), ensuring deterministic
+/// replay between injection and extraction.
+///
+/// If one pool is empty, the bias is clamped to the end that has tensors.
+fn select_donor_with_bias<'a>(
+	donor_sel: &mut DonorSelector,
+	eligible_fp16: &[&'a EligibleTensor],
+	eligible_fp32: &[&'a EligibleTensor],
+	dtype_bias: f64,
+) -> &'a EligibleTensor {
+	let (fp16_empty, fp32_empty) = (eligible_fp16.is_empty(), eligible_fp32.is_empty());
+	if fp16_empty && fp32_empty {
+		panic!("both donor pools are empty");
+	}
+
+	// Clamp bias based on what's available, then decide which pool to use.
+	let actual_bias = if fp16_empty {
+		1.0
+	} else if fp32_empty {
+		0.0
+	} else {
+		dtype_bias.clamp(0.0, 1.0)
+	};
+
+	let pool_choice = donor_sel.next_raw_u32();
+	let threshold = (actual_bias * u32::MAX as f64) as u32;
+	let use_fp32 = pool_choice < threshold;
+
+	if use_fp32 {
+		let idx = donor_sel.next_index(eligible_fp32.len());
+		eligible_fp32[idx]
+	} else {
+		let idx = donor_sel.next_index(eligible_fp16.len());
+		eligible_fp16[idx]
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -222,52 +279,32 @@ pub fn profile(model_path: &Path, alpha: f64) -> Result<String, Box<dyn std::err
 	let projected_payload_mb = (max_payload as f64) / (1024.0 * 1024.0);
 	let projected_disk_mb = projected_payload_mb * disk_multiplier;
 
-	let mut report = String::new();
-	use std::fmt::Write;
-
-	// "Profile complete." in blue bold
-	let _ = writeln!(report, "{}", "Profile complete.".blue().bold());
-	// Indented label/value lines
-	let _ = writeln!(
-		report,
-		"  {} {}    {}",
-		"Eligible FP32 tensors :".blue(),
+	let w = 30; // label width
+	let report = format!(
+		"{}\n  {} {} {}\n  {} {} {}\n  {} {}\n  {} {:.1}x{}\n  {} ~{:.1} MB{}\n  {} ~{:.1} MB{}",
+		"Profile complete.".blue().bold(),
+		format!("{:w$} :", "Eligible FP32 tensors", w = w).blue(),
 		fmt_count(fp32_eligible_count).white(),
 		format!("(total elements: {})", fmt_count(fp32_el)).dimmed(),
-	);
-	let _ = writeln!(
-		report,
-		"  {} {}    {}",
-		"Eligible FP16 tensors :".blue(),
+		format!("{:w$} :", "Eligible FP16 tensors", w = w).blue(),
 		fmt_count(fp16_eligible_count).white(),
 		format!("(total elements: {})", fmt_count(fp16_el)).dimmed(),
-	);
-	let _ = writeln!(
-		report,
-		"  {} {}",
-		"Combined eligible elements   :".blue(),
+		format!("{:w$} :", "Combined eligible elements", w = w).blue(),
 		fmt_count(total_el).white(),
-	);
-	let _ = writeln!(
-		report,
-		"  {} {:.1}x{}",
-		"Effective disk overhead range:".blue(),
+		format!("{:w$} :", "Effective disk overhead", w = w).blue(),
 		disk_multiplier,
 		" payload bytes".white(),
-	);
-	let _ = writeln!(
-		report,
-		"  {} ~{:.1} MB{}",
-		format!("Projected capacity @ {:.0}%     :", alpha * 100.0).blue(),
+		format!(
+			"{:w$} :",
+			format!("Projected capacity @ {:.0}%", alpha * 100.0),
+			w = w
+		)
+		.blue(),
 		projected_payload_mb,
 		" payload".white(),
-	);
-	let _ = write!(
-		report,
-		"{}  ~{:.1} MB{}",
-		"                               :".blue(),
+		format!("{:w$} :", "", w = w).blue(),
 		projected_disk_mb,
-		" disk overhead".white(),
+		" disk overhead".white()
 	);
 
 	Ok(report)
@@ -278,12 +315,18 @@ pub fn profile(model_path: &Path, alpha: f64) -> Result<String, Box<dyn std::err
 // ---------------------------------------------------------------------------
 
 /// Inject a payload into a donor ONNX model.
+///
+/// `dtype_bias` controls the FP32 vs FP16 donor mix:
+/// - 0.0 → only FP16 donors (stego tensors are FP16)
+/// - 1.0 → only FP32 donors (stego tensors are FP32)
+/// - 0.5 → balanced mix (default)
 pub fn inject(
 	model_path: &Path,
 	payload: &[u8],
 	passphrase: &str,
 	out_path: &Path,
 	alpha: f64,
+	dtype_bias: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
 	let subkeys = crate::crypto::derive_subkeys(passphrase)?;
 	let mut model = helpers::load_model(model_path)?;
@@ -308,6 +351,20 @@ pub fn inject(
 		.into());
 	}
 
+	// Split eligible into FP16 and FP32 pools for biased donor selection
+	let fp16_pool: Vec<&EligibleTensor> = eligible
+		.iter()
+		.filter(|e| e.data_type == DT_FLOAT16)
+		.collect();
+	let fp32_pool: Vec<&EligibleTensor> = eligible
+		.iter()
+		.filter(|e| e.data_type == DT_FLOAT)
+		.collect();
+
+	if fp16_pool.is_empty() && fp32_pool.is_empty() {
+		return Err("No eligible FP32 or FP16 tensors found".into());
+	}
+
 	let mut name_gen = NameGenerator::new(&subkeys.name);
 	let mut donor_sel = DonorSelector::new(&subkeys.profile);
 
@@ -316,9 +373,8 @@ pub fn inject(
 	let mut stego_tensors = Vec::new();
 
 	while bytes_consumed < total_payload_bytes {
-		// Pick the next donor
-		let donor_idx = donor_sel.next_index(eligible.len());
-		let donor = &eligible[donor_idx];
+		// Pick the next donor with dtype bias control
+		let donor = select_donor_with_bias(&mut donor_sel, &fp16_pool, &fp32_pool, dtype_bias);
 
 		// Build ECDF table
 		let table = crate::stats::build_ecdf_table(&donor.sorted_values)
@@ -440,9 +496,13 @@ pub fn inject(
 /// The name CSPRNG reproduces the same sequence as injection. Names that
 /// collide with the original donor model are skipped. Names that make it
 /// through and exist in the stego model are stego tensors.
+///
+/// `dtype_bias` must match the value used during injection for correct
+/// deterministic donor selection.  Default for new stego models is 0.5.
 pub fn extract(
 	model_path: &Path,
 	passphrase: &str,
+	dtype_bias: f64,
 ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
 	let subkeys = crate::crypto::derive_subkeys(passphrase)?;
 	let model = helpers::load_model(model_path)?;
@@ -491,13 +551,27 @@ pub fn extract(
 
 	// Step 3 (continued): donor pool R = M \ S (eligible FP32/FP16 only)
 	let all_eligible = helpers::eligible_initializers(&model);
-	let donor_pool: Vec<EligibleTensor> = all_eligible
+	let donor_vec: Vec<EligibleTensor> = all_eligible
 		.into_iter()
 		.filter(|e| !stego_set.contains(&e.name))
 		.collect();
 
-	if donor_pool.is_empty() {
+	if donor_vec.is_empty() {
 		return Err("Donor pool is empty".into());
+	}
+
+	// Split into FP16/FP32 pools for biased donor selection
+	let fp16_pool: Vec<&EligibleTensor> = donor_vec
+		.iter()
+		.filter(|e| e.data_type == DT_FLOAT16)
+		.collect();
+	let fp32_pool: Vec<&EligibleTensor> = donor_vec
+		.iter()
+		.filter(|e| e.data_type == DT_FLOAT)
+		.collect();
+
+	if fp16_pool.is_empty() && fp32_pool.is_empty() {
+		return Err("Donor pool has no eligible FP32 or FP16 tensors".into());
 	}
 
 	// Step 4-5: decode chunks using K_profile donor sequence
@@ -505,8 +579,7 @@ pub fn extract(
 	let mut donor_sel = DonorSelector::new(&subkeys.profile);
 
 	for stego_name in &stego_set {
-		let donor_idx = donor_sel.next_index(donor_pool.len());
-		let donor = &donor_pool[donor_idx];
+		let donor = select_donor_with_bias(&mut donor_sel, &fp16_pool, &fp32_pool, dtype_bias);
 
 		let (sorted_vals, sorted_idx) = crate::stats::build_sorted_ecdf_table(&donor.sorted_values)
 			.ok_or("Donor failed sorted ECDF table construction")?;
@@ -578,10 +651,14 @@ pub struct VerifyReport {
 ///   runs the two-sample K–S test (α = 0.05) and chi-squared byte-frequency
 ///   test (α = 0.05) on the chunk's raw bytes.
 ///
+/// `dtype_bias` must match the value used during injection for correct
+/// deterministic donor replay.  Default for new stego models is 0.5.
+///
 /// This command is purely analytical — it never writes or modifies a file.
 pub fn verify(
 	model_path: &Path,
 	passphrase: &str,
+	dtype_bias: f64,
 ) -> Result<VerifyReport, Box<dyn std::error::Error>> {
 	let subkeys = crate::crypto::derive_subkeys(passphrase)?;
 	let model = helpers::load_model(model_path)?;
@@ -615,14 +692,26 @@ pub fn verify(
 
 	// ── Step 2: build donor pool R = M \ S ──
 	let all_eligible = helpers::eligible_initializers(&model);
-	let donor_pool: Vec<&EligibleTensor> = all_eligible
+	let donor_vec: Vec<&EligibleTensor> = all_eligible
 		.iter()
 		.filter(|e| !stego_set.contains(&e.name))
 		.collect();
 
-	if donor_pool.is_empty() {
+	if donor_vec.is_empty() {
 		return Err("Donor pool is empty".into());
 	}
+
+	// Split into FP16/FP32 pools for biased selection
+	let fp16_pool: Vec<&EligibleTensor> = donor_vec
+		.iter()
+		.filter(|e| e.data_type == DT_FLOAT16)
+		.copied()
+		.collect();
+	let fp32_pool: Vec<&EligibleTensor> = donor_vec
+		.iter()
+		.filter(|e| e.data_type == DT_FLOAT)
+		.copied()
+		.collect();
 
 	// ── Step 3: verify each chunk ──
 	let graph = model.graph.as_ref().ok_or("Model has no graph")?;
@@ -633,8 +722,7 @@ pub fn verify(
 	let chi2_crit = crate::stats::CHI_SQUARED_CRITICAL_005;
 
 	for stego_name in &stego_set {
-		let donor_idx = donor_sel.next_index(donor_pool.len());
-		let donor = donor_pool[donor_idx];
+		let donor = select_donor_with_bias(&mut donor_sel, &fp16_pool, &fp32_pool, dtype_bias);
 
 		// Find the stego tensor in the model
 		let stego_tensor = graph
@@ -837,11 +925,11 @@ mod tests {
 		let passphrase = "test-passphrase-123";
 		let stream = crate::crypto::encrypt(payload, "test.txt", passphrase, 3).unwrap();
 
-		// Inject
-		inject(&donor_path, &stream, passphrase, &stego_path, 0.70).unwrap();
+		// Inject (default dtype_bias = 0.5 for balanced mix)
+		inject(&donor_path, &stream, passphrase, &stego_path, 0.70, 0.5).unwrap();
 
-		// Extract
-		let (recovered_data, recovered_name) = extract(&stego_path, passphrase).unwrap();
+		// Extract (must match injection dtype_bias)
+		let (recovered_data, recovered_name) = extract(&stego_path, passphrase, 0.5).unwrap();
 		assert_eq!(
 			recovered_data,
 			payload.to_vec(),

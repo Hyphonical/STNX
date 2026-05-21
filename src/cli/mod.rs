@@ -37,6 +37,9 @@ pub enum Commands {
 		/// Payload utilization factor (alpha), defaults to 0.70 (70%). Set to 1.0 or higher for unlimited.
 		#[arg(short, long, default_value_t = 0.70)]
 		alpha: f64,
+		/// FP16/FP32 dtype mixing ratio (0.0 = all FP16, 1.0 = all FP32, 0.5 = balanced).
+		#[arg(long, default_value_t = 0.50)]
+		dtype_bias: f64,
 	},
 	/// Extract a hidden payload from a stego ONNX model
 	Extract {
@@ -48,6 +51,9 @@ pub enum Commands {
 		/// Output path for the recovered file
 		#[arg(short, long)]
 		out: Option<PathBuf>,
+		/// FP16/FP32 dtype mixing ratio used during injection (default: 0.5).
+		#[arg(long, default_value_t = 0.50)]
+		dtype_bias: f64,
 	},
 	/// Verify a stego ONNX model's statistical integrity
 	Verify {
@@ -56,5 +62,8 @@ pub enum Commands {
 		/// Passphrase for key derivation (also via STNX_PASSPHRASE env)
 		#[arg(short, long, env = "STNX_PASSPHRASE")]
 		passphrase: String,
+		/// FP16/FP32 dtype mixing ratio used during injection (default: 0.5).
+		#[arg(long, default_value_t = 0.50)]
+		dtype_bias: f64,
 	},
 }

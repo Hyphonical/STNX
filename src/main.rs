@@ -30,6 +30,7 @@ fn main() {
 			zstd_level,
 			out,
 			alpha,
+			dtype_bias,
 		} => {
 			// Read payload file
 			let payload_bytes = match std::fs::read(&payload) {
@@ -69,7 +70,7 @@ fn main() {
 
 			let out_path = out.unwrap_or_else(|| model.with_extension("stego.onnx"));
 
-			match stego::inject(&model, &stream, &passphrase, &out_path, alpha) {
+			match stego::inject(&model, &stream, &passphrase, &out_path, alpha, dtype_bias) {
 				Ok(()) => {
 					println!(
 						"{} {}  ({} B payload → {} B stream)",
@@ -88,6 +89,7 @@ fn main() {
 			model,
 			passphrase,
 			out,
+			dtype_bias,
 		} => {
 			eprintln!(
 				"{} Extracting from {} …",
@@ -95,7 +97,7 @@ fn main() {
 				model.display().cyan()
 			);
 
-			match stego::extract(&model, &passphrase) {
+			match stego::extract(&model, &passphrase, dtype_bias) {
 				Ok((data, filename)) => {
 					let out_name = if filename.is_empty() {
 						"recovered_payload".to_string()
@@ -128,10 +130,14 @@ fn main() {
 				}
 			}
 		}
-		Commands::Verify { model, passphrase } => {
+		Commands::Verify {
+			model,
+			passphrase,
+			dtype_bias,
+		} => {
 			eprintln!("{} Verifying {} …", "…".cyan(), model.display().cyan());
 
-			match stego::verify(&model, &passphrase) {
+			match stego::verify(&model, &passphrase, dtype_bias) {
 				Ok(report) => {
 					if report.all_pass {
 						println!(
