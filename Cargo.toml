@@ -1,0 +1,44 @@
+[package]
+name         = "stnx"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.88.0"
+description  = "Constellation Encoding for ONNX Steganography"
+license      = "MIT"
+
+[[bin]]
+name = "stnx"
+path = "src/main.rs"
+
+[dependencies]
+# ── Command-Line Interface ─────────────────────────────────
+clap         = { version = "4", features = ["derive", "env"] }
+
+# ── Logging ────────────────────────────────────────────────
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# ── Terminal Output ────────────────────────────────────────
+owo-colors   = { version = "4", features = ["supports-colors"] }
+
+# ── Cryptography ───────────────────────────────────────────
+argon2       = "0.5.3"
+aes-gcm      = "0.10.3"
+sha2         = "0.11.0"
+
+# ── Compression ────────────────────────────────────────────
+zstd         = "0.13.3"
+
+# ── Serialization ──────────────────────────────────────────
+prost        = "0.14.3"
+
+# ── Release Profile ────────────────────────────────────────
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+strip         = true
+panic         = "abort"
+
+[build-dependencies]
+prost-build = "0.14.3"

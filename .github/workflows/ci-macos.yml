@@ -1,0 +1,54 @@
+name: macOS Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: 🚧 macOS aarch64
+    runs-on: macos-latest
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🦀 Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: 📦 Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: macos-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: 🚧 Build Release
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: 📦 Stage Files
+        run: |
+          mkdir dist
+          cp target/aarch64-apple-darwin/release/stnx dist/
+          [ -f LICENSE ] && cp LICENSE dist/ || true
+          [ -f README.md ] && cp README.md dist/ || true
+
+      - name: 📤 Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: stnx-macos-aarch64
+          path: dist/*
+          compression-level: 9
+          if-no-files-found: error
+          retention-days: 7
