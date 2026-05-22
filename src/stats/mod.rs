@@ -409,27 +409,50 @@ impl Fenwick {
 	/// Returns a 0-based index.
 	pub fn find(&self, mut target: i64) -> usize {
 		let mut idx = 0usize;
-		
+
 		if self.tree[256] <= target {
 			idx = 256;
 			target -= self.tree[256];
 		}
 		let mut t = idx + 128;
-		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; }
+		if t <= 256 && self.tree[t] <= target {
+			idx = t;
+			target -= self.tree[t];
+		}
 		t = idx + 64;
-		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; }
+		if t <= 256 && self.tree[t] <= target {
+			idx = t;
+			target -= self.tree[t];
+		}
 		t = idx + 32;
-		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; }
+		if t <= 256 && self.tree[t] <= target {
+			idx = t;
+			target -= self.tree[t];
+		}
 		t = idx + 16;
-		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; }
+		if t <= 256 && self.tree[t] <= target {
+			idx = t;
+			target -= self.tree[t];
+		}
 		t = idx + 8;
-		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; }
+		if t <= 256 && self.tree[t] <= target {
+			idx = t;
+			target -= self.tree[t];
+		}
 		t = idx + 4;
-		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; }
+		if t <= 256 && self.tree[t] <= target {
+			idx = t;
+			target -= self.tree[t];
+		}
 		t = idx + 2;
-		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; }
+		if t <= 256 && self.tree[t] <= target {
+			idx = t;
+			target -= self.tree[t];
+		}
 		t = idx + 1;
-		if t <= 256 && self.tree[t] <= target { idx = t; }
+		if t <= 256 && self.tree[t] <= target {
+			idx = t;
+		}
 
 		idx.saturating_sub(1)
 	}
@@ -441,28 +464,59 @@ impl Fenwick {
 	pub fn find_with_cum(&self, mut target: i64) -> (usize, u64) {
 		let mut idx = 0usize;
 		let mut cum = 0i64;
-		
+
 		if self.tree[256] <= target {
 			idx = 256;
 			target -= self.tree[256];
 			cum += self.tree[256];
 		}
 		let mut t = idx + 128;
-		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; cum += self.tree[t]; }
+		if t <= 256 && self.tree[t] <= target {
+			idx = t;
+			target -= self.tree[t];
+			cum += self.tree[t];
+		}
 		t = idx + 64;
-		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; cum += self.tree[t]; }
+		if t <= 256 && self.tree[t] <= target {
+			idx = t;
+			target -= self.tree[t];
+			cum += self.tree[t];
+		}
 		t = idx + 32;
-		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; cum += self.tree[t]; }
+		if t <= 256 && self.tree[t] <= target {
+			idx = t;
+			target -= self.tree[t];
+			cum += self.tree[t];
+		}
 		t = idx + 16;
-		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; cum += self.tree[t]; }
+		if t <= 256 && self.tree[t] <= target {
+			idx = t;
+			target -= self.tree[t];
+			cum += self.tree[t];
+		}
 		t = idx + 8;
-		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; cum += self.tree[t]; }
+		if t <= 256 && self.tree[t] <= target {
+			idx = t;
+			target -= self.tree[t];
+			cum += self.tree[t];
+		}
 		t = idx + 4;
-		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; cum += self.tree[t]; }
+		if t <= 256 && self.tree[t] <= target {
+			idx = t;
+			target -= self.tree[t];
+			cum += self.tree[t];
+		}
 		t = idx + 2;
-		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; cum += self.tree[t]; }
+		if t <= 256 && self.tree[t] <= target {
+			idx = t;
+			target -= self.tree[t];
+			cum += self.tree[t];
+		}
 		t = idx + 1;
-		if t <= 256 && self.tree[t] <= target { idx = t; cum += self.tree[t]; }
+		if t <= 256 && self.tree[t] <= target {
+			idx = t;
+			cum += self.tree[t];
+		}
 
 		// idx is 1-based inclusive index; `cum` is `sum(idx)`.
 		(idx.saturating_sub(1), cum as u64)
@@ -753,10 +807,10 @@ pub fn encode_for_donor(
 			let mut cursor = BitstreamCursor::new(chunk_bytes.to_vec(), pad_seed);
 			let n = scalar_count;
 
-            // Bulk-allocate and fill the bitstream in one shot
-            let bitstream_len = 8 + 2 * n;
-            let mut bitstream = vec![0u8; bitstream_len];
-            cursor.fill_buffer(&mut bitstream);
+			// Bulk-allocate and fill the bitstream in one shot
+			let bitstream_len = 8 + 2 * n;
+			let mut bitstream = vec![0u8; bitstream_len];
+			cursor.fill_buffer(&mut bitstream);
 
 			let indices = decode_int8_block(&bitstream, counts_ref, n);
 

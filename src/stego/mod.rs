@@ -208,8 +208,13 @@ impl<'a> Pool<'a> {
 /// Strategy (INT8.md §3.1):
 /// 1. Compute Natural Ratio weights from per-dtype eligible elements.
 /// 2. Draw a dtype via CSPRNG using the categorical distribution.
-/// 3. Select the **largest remaining unselected** tensor from that pool.
+/// 3. Select the next tensor from that pool (first-in-first-out).
 /// 4. If a pool is exhausted, renormalize over remaining pools.
+///
+/// **Pool ordering matters.**  FP32/FP16 pools are descending by size
+/// (largest first — per-element ECDF cost is trivial).  INT8/UINT8 pools
+/// are ascending by size (smallest first — multiset permutation decoder
+/// has O(n) per-element cost via u128 range coder; see INT8.md §4).
 ///
 /// # Panics
 ///
@@ -233,7 +238,7 @@ fn select_donor_natural<'a>(
 		})
 		.expect("categorical choice must fall within total weight");
 
-	// Consume the largest remaining tensor from the chosen pool
+	// Consume the next tensor from the chosen pool (FIFO order, determined by build_pools)
 	let pool = &mut pools[pool_idx];
 	if pool.tensors.is_empty() {
 		// Pool exhausted; renormalize: zero out and retry
@@ -241,7 +246,7 @@ fn select_donor_natural<'a>(
 		return select_donor_natural(donor_sel, pools);
 	}
 
-	// Descending-size order means tensors[0] is the largest remaining
+	// Pool head is the next-in-line tensor; remove it and recompute weight
 	let result = pool.tensors.remove(0);
 	// Update pool weight (recompute from remaining tensors)
 	pool.total_elements = pool.tensors.iter().map(|t| t.scalar_count).sum();
@@ -249,6 +254,16 @@ fn select_donor_natural<'a>(
 }
 
 /// Build dtype pools for Natural Ratio selection.
+///
+/// FP32/FP16 pools are kept in descending size order so that large ECDF
+/// donors are consumed first; per-element cost is trivial for floats.
+///
+/// INT8/UINT8 pools are reversed to **ascending** size order so that small
+/// donors are consumed first.  This avoids the catastrophic case where a
+/// small final payload chunk selects a 9M-element donor and then spends
+/// minutes in the O(n)-per-element multiset permutation decoder loop.
+/// Both injector and extractor call this function on the same eligible
+/// list, so the donor sequence remains deterministic and reproducible.
 fn build_pools<'a>(eligible: &'a [EligibleTensor]) -> Vec<Pool<'a>> {
 	let fp32: Vec<&EligibleTensor> = eligible
 		.iter()
@@ -258,11 +273,19 @@ fn build_pools<'a>(eligible: &'a [EligibleTensor]) -> Vec<Pool<'a>> {
 		.iter()
 		.filter(|e| e.data_type == DT_FLOAT16)
 		.collect();
-	let int8: Vec<&EligibleTensor> = eligible.iter().filter(|e| e.data_type == DT_INT8).collect();
-	let uint8: Vec<&EligibleTensor> = eligible
+	let mut int8: Vec<&EligibleTensor> = eligible
+		.iter()
+		.filter(|e| e.data_type == DT_INT8)
+		.collect();
+	let mut uint8: Vec<&EligibleTensor> = eligible
 		.iter()
 		.filter(|e| e.data_type == DT_UINT8)
 		.collect();
+
+	// Smallest-first for INT8/UINT8 to avoid O(n) per-element decoder tax
+	// on leftover chunks (see INT8.md §4, §10.3).
+	int8.reverse();
+	uint8.reverse();
 
 	let mut pools = Vec::new();
 	for tensors in [fp32, fp16, int8, uint8] {
@@ -434,7 +457,7 @@ pub fn inject(
 		.into());
 	}
 
-	// Build Natural Ratio pools (sorted descending already by eligible_initializers)
+	// Build Natural Ratio pools (FP32/FP16 descending, INT8/UINT8 ascending)
 	let mut pools = build_pools(&eligible);
 	if pools.is_empty() {
 		return Err("No eligible tensors found (FP32, FP16, INT8, or UINT8)".into());
