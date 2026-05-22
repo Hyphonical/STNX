@@ -409,15 +409,28 @@ impl Fenwick {
 	/// Returns a 0-based index.
 	pub fn find(&self, mut target: i64) -> usize {
 		let mut idx = 0usize;
-		let mut bit = 1 << 8;
-		while bit != 0 {
-			let t = idx + bit;
-			if t <= 256 && self.tree[t] <= target {
-				idx = t;
-				target -= self.tree[t];
-			}
-			bit >>= 1;
+		
+		if self.tree[256] <= target {
+			idx = 256;
+			target -= self.tree[256];
 		}
+		let mut t = idx + 128;
+		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; }
+		t = idx + 64;
+		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; }
+		t = idx + 32;
+		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; }
+		t = idx + 16;
+		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; }
+		t = idx + 8;
+		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; }
+		t = idx + 4;
+		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; }
+		t = idx + 2;
+		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; }
+		t = idx + 1;
+		if t <= 256 && self.tree[t] <= target { idx = t; }
+
 		idx.saturating_sub(1)
 	}
 
@@ -428,16 +441,29 @@ impl Fenwick {
 	pub fn find_with_cum(&self, mut target: i64) -> (usize, u64) {
 		let mut idx = 0usize;
 		let mut cum = 0i64;
-		let mut bit = 1 << 8;
-		while bit != 0 {
-			let t = idx + bit;
-			if t <= 256 && self.tree[t] <= target {
-				idx = t;
-				target -= self.tree[t];
-				cum += self.tree[t];
-			}
-			bit >>= 1;
+		
+		if self.tree[256] <= target {
+			idx = 256;
+			target -= self.tree[256];
+			cum += self.tree[256];
 		}
+		let mut t = idx + 128;
+		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; cum += self.tree[t]; }
+		t = idx + 64;
+		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; cum += self.tree[t]; }
+		t = idx + 32;
+		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; cum += self.tree[t]; }
+		t = idx + 16;
+		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; cum += self.tree[t]; }
+		t = idx + 8;
+		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; cum += self.tree[t]; }
+		t = idx + 4;
+		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; cum += self.tree[t]; }
+		t = idx + 2;
+		if t <= 256 && self.tree[t] <= target { idx = t; target -= self.tree[t]; cum += self.tree[t]; }
+		t = idx + 1;
+		if t <= 256 && self.tree[t] <= target { idx = t; cum += self.tree[t]; }
+
 		// idx is 1-based inclusive index; `cum` is `sum(idx)`.
 		(idx.saturating_sub(1), cum as u64)
 	}
@@ -632,14 +658,16 @@ pub fn encode_int8_block(symbols: &[u8], counts: &[usize; 256]) -> Vec<u8> {
 	}
 
 	let mut enc = RangeEncoder::new();
+	let mut total_symbols = fenwick.total() as u64;
 	for &sym in symbols {
 		let idx = sym as usize;
 		let freq = flat_counts[idx] as u64;
 		let cum = fenwick.sum(idx) as u64 - freq;
-		let total = fenwick.total() as u64;
+		let total = total_symbols;
 		enc.encode(cum, freq, total);
 		fenwick.add(idx, -1);
 		flat_counts[idx] -= 1;
+		total_symbols -= 1;
 	}
 	enc.finish()
 }
@@ -663,8 +691,9 @@ pub fn decode_int8_block(bitstream: &[u8], counts: &[usize; 256], n: usize) -> V
 	for (i, &c) in counts.iter().enumerate() {
 		flat_counts[i] = c as i64;
 	}
+	let mut total_symbols = fenwick.total() as u64;
 	for _ in 0..n {
-		let total = fenwick.total() as u64;
+		let total = total_symbols;
 		let scaled = dec.get_scaled(total);
 		let (idx, sum_cum) = fenwick.find_with_cum(scaled as i64);
 		// sum_cum is inclusive prefix sum up to idx
@@ -673,6 +702,7 @@ pub fn decode_int8_block(bitstream: &[u8], counts: &[usize; 256], n: usize) -> V
 		dec.decode(cum, freq, total);
 		fenwick.add(idx, -1);
 		flat_counts[idx] -= 1;
+		total_symbols -= 1;
 		out.push(idx as u8);
 	}
 	out
