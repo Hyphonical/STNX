@@ -420,6 +420,27 @@ impl Fenwick {
 		}
 		idx.saturating_sub(1)
 	}
+
+	/// Find the largest index such that `prefix_sum(idx) <= target`,
+	/// returning both the 0-based index and the *inclusive* prefix sum
+	/// `sum(idx)`.  This avoids the caller making a second O(log N)
+	/// `sum(idx)` call just to compute the frequency.
+	pub fn find_with_cum(&self, mut target: i64) -> (usize, u64) {
+		let mut idx = 0usize;
+		let mut cum = 0i64;
+		let mut bit = 1 << 8;
+		while bit != 0 {
+			let t = idx + bit;
+			if t <= 256 && self.tree[t] <= target {
+				idx = t;
+				target -= self.tree[t];
+				cum += self.tree[t];
+			}
+			bit >>= 1;
+		}
+		// idx is 1-based inclusive index; `cum` is `sum(idx)`.
+		(idx.saturating_sub(1), cum as u64)
+	}
 }
 
 impl Default for Fenwick {
@@ -574,6 +595,20 @@ impl BitstreamCursor {
 		}
 	}
 
+	/// Bulk-fill `buf` with remaining payload bytes first, then CSPRNG
+	/// padding.  Much faster than calling `next_byte` in a loop because
+	/// it avoids per-byte RNG sealing.
+	pub fn fill_buffer(&mut self, buf: &mut [u8]) {
+		let remaining = self.payload.len().saturating_sub(self.byte_pos);
+		let copy = remaining.min(buf.len());
+		buf[..copy].copy_from_slice(&self.payload[self.byte_pos..self.byte_pos + copy]);
+		self.byte_pos += copy;
+		if copy < buf.len() {
+			use rand::Rng;
+			self.pad.fill_bytes(&mut buf[copy..]);
+		}
+	}
+
 	pub fn remaining_payload(&self) -> usize {
 		self.payload.len().saturating_sub(self.byte_pos)
 	}
@@ -590,22 +625,21 @@ impl BitstreamCursor {
 /// Returns the compressed bitstream.
 pub fn encode_int8_block(symbols: &[u8], counts: &[usize; 256]) -> Vec<u8> {
 	let mut fenwick = Fenwick::new();
+	let mut flat_counts = [0i64; 256];
 	for (i, &c) in counts.iter().enumerate() {
 		fenwick.add(i, c as i64);
+		flat_counts[i] = c as i64;
 	}
 
 	let mut enc = RangeEncoder::new();
 	for &sym in symbols {
 		let idx = sym as usize;
-		let cum = if idx == 0 {
-			0
-		} else {
-			fenwick.sum(idx - 1) as u64
-		};
-		let freq = fenwick.sum(idx) as u64 - cum;
+		let freq = flat_counts[idx] as u64;
+		let cum = fenwick.sum(idx) as u64 - freq;
 		let total = fenwick.total() as u64;
 		enc.encode(cum, freq, total);
 		fenwick.add(idx, -1);
+		flat_counts[idx] -= 1;
 	}
 	enc.finish()
 }
@@ -624,18 +658,21 @@ pub fn decode_int8_block(bitstream: &[u8], counts: &[usize; 256], n: usize) -> V
 
 	let mut dec = RangeDecoder::new(bitstream);
 	let mut out = Vec::with_capacity(n);
+	// Keep flat counts for O(1) frequency lookup — avoids a second Fenwick sum call
+	let mut flat_counts = [0i64; 256];
+	for (i, &c) in counts.iter().enumerate() {
+		flat_counts[i] = c as i64;
+	}
 	for _ in 0..n {
 		let total = fenwick.total() as u64;
 		let scaled = dec.get_scaled(total);
-		let idx = fenwick.find(scaled as i64);
-		let cum = if idx == 0 {
-			0
-		} else {
-			fenwick.sum(idx - 1) as u64
-		};
-		let freq = fenwick.sum(idx) as u64 - cum;
+		let (idx, sum_cum) = fenwick.find_with_cum(scaled as i64);
+		// sum_cum is inclusive prefix sum up to idx
+		let freq = flat_counts[idx] as u64;
+		let cum = sum_cum - freq;
 		dec.decode(cum, freq, total);
 		fenwick.add(idx, -1);
+		flat_counts[idx] -= 1;
 		out.push(idx as u8);
 	}
 	out
@@ -686,11 +723,10 @@ pub fn encode_for_donor(
 			let mut cursor = BitstreamCursor::new(chunk_bytes.to_vec(), pad_seed);
 			let n = scalar_count;
 
-			// Buffer for reading bytes for the decoder
-			let mut bitstream = Vec::new();
-			while bitstream.len() < 8 + 2 * n {
-				bitstream.push(cursor.next_byte());
-			}
+            // Bulk-allocate and fill the bitstream in one shot
+            let bitstream_len = 8 + 2 * n;
+            let mut bitstream = vec![0u8; bitstream_len];
+            cursor.fill_buffer(&mut bitstream);
 
 			let indices = decode_int8_block(&bitstream, counts_ref, n);
 

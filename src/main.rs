@@ -92,6 +92,11 @@ fn main() {
 						break;
 					}
 					Err(e) => {
+						eprintln!(
+							"{} Attempt {} failed: {e}",
+							"✗".red().bold(),
+							attempt.to_string().white()
+						);
 						if attempt == 50 {
 							eprintln!(
 								"{} Injection failed after 50 attempts: {e}",
