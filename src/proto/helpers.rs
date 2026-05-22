@@ -421,7 +421,7 @@ pub fn eligible_initializers(model: &ModelProto) -> Vec<EligibleTensor> {
 	}
 
 	// Sort by element count descending for Natural Ratio (INT8.md §3.2)
-	results.sort_by(|a, b| b.scalar_count.cmp(&a.scalar_count));
+	results.sort_by_key(|b| std::cmp::Reverse(b.scalar_count));
 	results
 }
 
