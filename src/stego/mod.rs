@@ -446,9 +446,28 @@ pub fn inject(
 	let total_payload_bytes = payload.len();
 	let mut bytes_consumed = 0usize;
 	let mut stego_tensors = Vec::new();
+	let mut chunk_index = 0usize;
 
 	while bytes_consumed < total_payload_bytes {
+		chunk_index += 1;
 		let donor = select_donor_natural(&mut donor_sel, &mut pools);
+
+		let dtypename = match donor.data_type {
+			DT_FLOAT => "FP32",
+			DT_FLOAT16 => "FP16",
+			DT_INT8 => "INT8",
+			DT_UINT8 => "UINT8",
+			_ => "?",
+		};
+		eprintln!(
+			"{} Chunk {:2}: {}  ({}, {} el) {}",
+			"…".cyan(),
+			chunk_index,
+			donor.name.cyan(),
+			dtypename.white(),
+			fmt_count(donor.scalar_count).white(),
+			"…".cyan(),
+		);
 
 		match donor.data_type {
 			DT_FLOAT | DT_FLOAT16 => {
@@ -629,9 +648,28 @@ pub fn extract(
 	// Step 4-5: decode chunks using Natural Ratio donor sequence
 	let mut decoded_bytes = Vec::new();
 	let mut donor_sel = DonorSelector::new(&subkeys.profile);
+	let total_chunks = stego_set.len();
 
-	for stego_name in &stego_set {
+	for (chunk_index, stego_name) in stego_set.iter().enumerate() {
 		let donor = select_donor_natural(&mut donor_sel, &mut pools);
+
+		let dtypename = match donor.data_type {
+			DT_FLOAT => "FP32",
+			DT_FLOAT16 => "FP16",
+			DT_INT8 => "INT8",
+			DT_UINT8 => "UINT8",
+			_ => "?",
+		};
+		eprintln!(
+			"{} Chunk {:2}/{}: {}  ({}, {} el) {}",
+			"…".cyan(),
+			chunk_index + 1,
+			total_chunks,
+			stego_name.cyan(),
+			dtypename.white(),
+			fmt_count(donor.scalar_count).white(),
+			"…".cyan(),
+		);
 
 		let stego_tensor = model
 			.graph
