@@ -108,10 +108,87 @@ impl From<prost::EncodeError> for ProtoError {
 // ---------------------------------------------------------------------------
 
 /// Load an ONNX model from a file path.
+///
+/// Automatically resolves external data references (`data_location = EXTERNAL`)
+/// by reading the referenced file(s) and populating `raw_data` on each
+/// affected tensor.  This makes the model self-contained and allows all
+/// downstream processing (profiling, injection, extraction) to operate on
+/// the tensor data without any special external-data code paths.
+///
+/// Tensors whose external data file cannot be found are left as-is; the
+/// eligibility filter in `eligible_initializers` will skip them naturally.
 pub fn load_model(path: &Path) -> Result<ModelProto, ProtoError> {
 	let bytes = std::fs::read(path)?;
-	let model = ModelProto::decode(bytes.as_slice())?;
+	let mut model = ModelProto::decode(bytes.as_slice())?;
+	resolve_external_data(&mut model, path);
 	Ok(model)
+}
+
+/// Resolve external data references in all graph initializers.
+///
+/// Reads the `external_data` key-value entries on each tensor (ONNX spec:
+/// keys `"location"`, `"offset"`, `"length"`), resolves the path relative
+/// to the model file's parent directory, reads the bytes, and populates
+/// `raw_data`.  After resolution, `data_location` is cleared and
+/// `external_data` is emptied so the tensor behaves like an inline tensor.
+fn resolve_external_data(model: &mut ModelProto, model_path: &Path) {
+	let model_dir = model_path.parent().unwrap_or(Path::new("."));
+
+	let graph = match model.graph.as_mut() {
+		Some(g) => g,
+		None => return,
+	};
+
+	for tensor in &mut graph.initializer {
+		// `data_location` = 1 means EXTERNAL (0 = DEFAULT)
+		if tensor.data_location.unwrap_or(0) != 1 {
+			continue;
+		}
+
+		// Parse external_data key-value entries
+		let mut location: Option<String> = None;
+		let mut offset: u64 = 0;
+		let mut length: Option<usize> = None;
+
+		for entry in &tensor.external_data {
+			let key = entry.key.as_deref().unwrap_or("");
+			let val = entry.value.as_deref().unwrap_or("");
+			match key {
+				"location" => location = Some(val.to_string()),
+				"offset" => offset = val.parse::<u64>().unwrap_or(0),
+				"length" => length = val.parse::<usize>().ok(),
+				_ => { /* ignore unknown keys (e.g. "checksum") */ }
+			}
+		}
+
+		let loc = match location {
+			Some(l) => l,
+			None => continue, // no location → unresolvable, skip
+		};
+
+		let external_path = model_dir.join(&loc);
+
+		// Read the external data file
+		let mut data = match std::fs::read(&external_path) {
+			Ok(d) => d,
+			Err(_) => continue, // file missing → skip (eligibility filter will drop it)
+		};
+
+		// Apply optional offset and length
+		let start = offset as usize;
+		if start > 0 || length.is_some() {
+			let end = length
+				.map(|l| (start + l).min(data.len()))
+				.unwrap_or(data.len());
+			data = data[start..end].to_vec();
+		}
+
+		// Populate raw_data and clear external markers so downstream code
+		// treats this tensor as a normal inline tensor.
+		tensor.raw_data = Some(data);
+		tensor.data_location = None; // back to DEFAULT
+		tensor.external_data.clear();
+	}
 }
 
 /// Save an ONNX model to a file path.
