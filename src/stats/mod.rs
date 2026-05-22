@@ -1,9 +1,11 @@
 //! Statistical analysis and ECDF table construction for Constellation Encoding.
 //!
 //! Implements the order-statistic lookup table builder, two-sample K–S test,
-//! chi-squared byte-frequency test, and padding CSPRNG as specified in
-//! PLAN.md Sections 4.2 and 10.2.
+//! chi-squared byte-frequency test, padding CSPRNG (PLAN.md §§4.2, 10.2), and
+//! the multiset permutation encoder/decoder for INT8/UINT8 donors (INT8.md
+//! §§2, 4, 10).
 
+use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
 use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
@@ -326,6 +328,459 @@ pub const CHI_SQUARED_CRITICAL_005: f64 = 293.247_835;
 pub fn chi_squared_test_passes(obs: &[u64], exp: &[f64]) -> bool {
 	let statistic = chi_squared_byte_test(obs, exp);
 	statistic <= CHI_SQUARED_CRITICAL_005
+}
+
+// ---------------------------------------------------------------------------
+// Empirical entropy  (INT8.md §5.2)
+// ---------------------------------------------------------------------------
+
+/// Compute the empirical Shannon entropy of a discrete distribution.
+///
+/// Returns 0.0 if `n == 0`.
+pub fn empirical_entropy(counts: &[usize; 256], n: usize) -> f64 {
+	if n == 0 {
+		return 0.0;
+	}
+	let nf = n as f64;
+	let mut h = 0.0;
+	for &c in counts {
+		if c > 0 {
+			let p = c as f64 / nf;
+			h -= p * p.log2();
+		}
+	}
+	h
+}
+
+/// Conservative capacity estimate for an INT8/UINT8 donor.
+///
+/// `C_safe = floor((n * H - 256 * log2(n) - 64) / 8)`  (INT8.md §5.3)
+pub fn int8_safe_capacity(n: usize, entropy: f64) -> usize {
+	let penalty = 256.0 * (n as f64).log2() + 64.0;
+	let bits = n as f64 * entropy - penalty;
+	if bits.is_sign_negative() || bits.is_nan() {
+		0
+	} else {
+		(bits / 8.0).floor() as usize
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fenwick tree for adaptive symbol counts  (INT8.md §10.1)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct Fenwick {
+	tree: [i64; 257], // 1-indexed
+}
+
+impl Fenwick {
+	pub fn new() -> Self {
+		Self { tree: [0; 257] }
+	}
+
+	/// Increment count at index `i` (0-based) by `delta`.
+	pub fn add(&mut self, mut i: usize, delta: i64) {
+		i += 1;
+		while i <= 256 {
+			self.tree[i] += delta;
+			i += i & i.wrapping_neg();
+		}
+	}
+
+	/// Inclusive prefix sum [0..i] (0-based).
+	pub fn sum(&self, i: usize) -> i64 {
+		let mut idx = i + 1;
+		let mut res = 0i64;
+		while idx > 0 {
+			res += self.tree[idx];
+			idx -= idx & idx.wrapping_neg();
+		}
+		res
+	}
+
+	/// Total sum of all 256 symbols.
+	pub fn total(&self) -> i64 {
+		self.sum(255)
+	}
+
+	/// Find the largest index such that `prefix_sum(idx) <= target`.
+	///
+	/// Returns a 0-based index.
+	pub fn find(&self, mut target: i64) -> usize {
+		let mut idx = 0usize;
+		let mut bit = 1 << 8;
+		while bit != 0 {
+			let t = idx + bit;
+			if t <= 256 && self.tree[t] <= target {
+				idx = t;
+				target -= self.tree[t];
+			}
+			bit >>= 1;
+		}
+		idx.saturating_sub(1)
+	}
+}
+
+impl Default for Fenwick {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 64-bit range encoder (extraction: symbols → bits)  (INT8.md §10.2)
+// ---------------------------------------------------------------------------
+
+pub struct RangeEncoder {
+	low: u64,
+	range: u64,
+	out: Vec<u8>,
+}
+
+impl RangeEncoder {
+	pub fn new() -> Self {
+		Self {
+			low: 0,
+			range: u64::MAX,
+			out: Vec::new(),
+		}
+	}
+
+	/// Encode a symbol with cumulative count `cum`, frequency `freq`,
+	/// given `total` remaining symbols.
+	pub fn encode(&mut self, cum: u64, freq: u64, total: u64) {
+		let r = (self.range as u128) / (total as u128);
+		self.low += (r * (cum as u128)) as u64;
+		self.range = (r * (freq as u128)) as u64;
+
+		while self.range < (1u64 << 56) {
+			self.out.push((self.low >> 56) as u8);
+			self.low <<= 8;
+			self.range <<= 8;
+		}
+	}
+
+	/// Flush remaining state: write 8 final bytes.
+	pub fn finish(mut self) -> Vec<u8> {
+		for _ in 0..8 {
+			self.out.push((self.low >> 56) as u8);
+			self.low <<= 8;
+		}
+		self.out
+	}
+}
+
+impl Default for RangeEncoder {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 64-bit range decoder (injection: bits → symbols)  (INT8.md §10.3)
+// ---------------------------------------------------------------------------
+
+pub struct RangeDecoder<'a> {
+	low: u64,
+	range: u64,
+	code: u64,
+	src: &'a [u8],
+	pos: usize,
+}
+
+impl<'a> RangeDecoder<'a> {
+	pub fn new(src: &'a [u8]) -> Self {
+		let mut code = 0u64;
+		let mut pos = 0;
+		for _ in 0..8 {
+			code = (code << 8) | (*src.get(pos).unwrap_or(&0) as u64);
+			pos += 1;
+		}
+		Self {
+			low: 0,
+			range: u64::MAX,
+			code,
+			src,
+			pos,
+		}
+	}
+
+	/// Given `total`, return the scaled value used to find the symbol.
+	pub fn get_scaled(&self, total: u64) -> u64 {
+		(((self.code - self.low) as u128) * (total as u128) / (self.range as u128)) as u64
+	}
+
+	/// Consume a symbol with cumulative count `cum`, frequency `freq`,
+	/// given `total` remaining symbols.
+	pub fn decode(&mut self, cum: u64, freq: u64, total: u64) {
+		let r = (self.range as u128) / (total as u128);
+		self.low += (r * (cum as u128)) as u64;
+		self.range = (r * (freq as u128)) as u64;
+
+		while self.range < (1u64 << 56) {
+			self.code = (self.code << 8) | (*self.src.get(self.pos).unwrap_or(&0) as u64);
+			self.low <<= 8;
+			self.range <<= 8;
+			self.pos += 1;
+		}
+	}
+
+	/// Bytes consumed from the source so far.
+	pub fn bytes_consumed(&self) -> usize {
+		self.pos
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bitstream cursor for injection  (INT8.md §10.5)
+// ---------------------------------------------------------------------------
+
+pub struct BitstreamCursor {
+	payload: Vec<u8>,
+	pad: ChaCha20Rng,
+	byte_pos: usize,
+}
+
+impl BitstreamCursor {
+	pub fn new(payload: Vec<u8>, pad_seed: &[u8; 32]) -> Self {
+		// Derive ChaCha20 seed from the pad subkey
+		let mut seed = [0u8; 32];
+		let mut hasher = Sha256::new();
+		hasher.update(b"stnx.int8.bitstream");
+		hasher.update(pad_seed);
+		let hash = hasher.finalize();
+		seed.copy_from_slice(&hash);
+		let pad = ChaCha20Rng::from_seed(seed);
+		Self {
+			payload,
+			pad,
+			byte_pos: 0,
+		}
+	}
+
+	/// Get the next byte from the cursors. Falls back to CSPRNG padding
+	/// once the payload is exhausted.
+	pub fn next_byte(&mut self) -> u8 {
+		if self.byte_pos < self.payload.len() {
+			let b = self.payload[self.byte_pos];
+			self.byte_pos += 1;
+			b
+		} else {
+			use rand::Rng;
+			let mut buf = [0u8; 1];
+			self.pad.fill_bytes(&mut buf);
+			buf[0]
+		}
+	}
+
+	pub fn remaining_payload(&self) -> usize {
+		self.payload.len().saturating_sub(self.byte_pos)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Block-level INT8/UINT8 encode / decode  (INT8.md §10.4)
+// ---------------------------------------------------------------------------
+
+/// Encode a block of INT8/UINT8 indices into a bitstream.
+///
+/// `symbols`: the symbol indices (0..255).
+/// `counts`: the donor histogram.
+/// Returns the compressed bitstream.
+pub fn encode_int8_block(symbols: &[u8], counts: &[usize; 256]) -> Vec<u8> {
+	let mut fenwick = Fenwick::new();
+	for (i, &c) in counts.iter().enumerate() {
+		fenwick.add(i, c as i64);
+	}
+
+	let mut enc = RangeEncoder::new();
+	for &sym in symbols {
+		let idx = sym as usize;
+		let cum = if idx == 0 {
+			0
+		} else {
+			fenwick.sum(idx - 1) as u64
+		};
+		let freq = fenwick.sum(idx) as u64 - cum;
+		let total = fenwick.total() as u64;
+		enc.encode(cum, freq, total);
+		fenwick.add(idx, -1);
+	}
+	enc.finish()
+}
+
+/// Decode a block of INT8/UINT8 indices from a bitstream.
+///
+/// `bitstream`: the compressed data from `encode_int8_block`.
+/// `counts`: the donor histogram.
+/// `n`: number of symbols to decode.
+/// Returns the decoded symbol indices.
+pub fn decode_int8_block(bitstream: &[u8], counts: &[usize; 256], n: usize) -> Vec<u8> {
+	let mut fenwick = Fenwick::new();
+	for (i, &c) in counts.iter().enumerate() {
+		fenwick.add(i, c as i64);
+	}
+
+	let mut dec = RangeDecoder::new(bitstream);
+	let mut out = Vec::with_capacity(n);
+	for _ in 0..n {
+		let total = fenwick.total() as u64;
+		let scaled = dec.get_scaled(total);
+		let idx = fenwick.find(scaled as i64);
+		let cum = if idx == 0 {
+			0
+		} else {
+			fenwick.sum(idx - 1) as u64
+		};
+		let freq = fenwick.sum(idx) as u64 - cum;
+		dec.decode(cum, freq, total);
+		fenwick.add(idx, -1);
+		out.push(idx as u8);
+	}
+	out
+}
+
+// ---------------------------------------------------------------------------
+// Smart bitstream: encode/decode with hybrid ECDF / multiset dispatch
+// ---------------------------------------------------------------------------
+
+/// Encode payload bytes for a given donor.
+///
+/// FP32/FP16: uses `encode_chunk`.
+/// INT8/UINT8: uses the multiset permutation decoder (decodes bits to symbols).
+///
+/// `donor_scalar_count`: number of elements the stego tensor will have.
+/// `remaining_payload`: bytes remaining in the payload.
+/// Returns `(stego_values, bytes_consumed_from_payload)`.
+pub fn encode_for_donor(
+	chunk_bytes: &[u8],
+	pad_seed: &[u8; 32],
+	data_type: i32,
+	ecdf_table: &[f32; 256],
+	counts: Option<&[usize; 256]>,
+	scalar_count: usize,
+) -> Vec<u8> {
+	match data_type {
+		crate::proto::helpers::DT_FLOAT | crate::proto::helpers::DT_FLOAT16 => {
+			// ECDF path: 1 byte → 1 float (PLAN.md §4.2)
+			let encoded = encode_chunk(chunk_bytes, ecdf_table);
+			// Pad if needed
+			let combined = if encoded.len() < scalar_count {
+				let pad_len = scalar_count - encoded.len();
+				let mut rng = PaddingRng::new(pad_seed);
+				let pad_bytes = rng.generate(pad_len);
+				let pad_encoded = encode_chunk(&pad_bytes, ecdf_table);
+				let mut c = encoded;
+				c.extend_from_slice(&pad_encoded);
+				c
+			} else {
+				encoded
+			};
+			serialize_floats(&combined, data_type)
+		}
+		crate::proto::helpers::DT_INT8 | crate::proto::helpers::DT_UINT8 => {
+			// Multiset permutation path (INT8.md §4)
+			let counts_ref = counts.expect("counts required for INT8/UINT8");
+			// Prepare bitstream: payload bytes + fallback to K_pad CSPRNG
+			let mut cursor = BitstreamCursor::new(chunk_bytes.to_vec(), pad_seed);
+			let n = scalar_count;
+
+			// Buffer for reading bytes for the decoder
+			let mut bitstream = Vec::new();
+			while bitstream.len() < 8 + 2 * n {
+				bitstream.push(cursor.next_byte());
+			}
+
+			let indices = decode_int8_block(&bitstream, counts_ref, n);
+
+			// Convert indices back to raw bytes
+			let raw: Vec<u8> = match data_type {
+				crate::proto::helpers::DT_INT8 => indices
+					.iter()
+					.map(|&idx| (idx as i16 - 128) as i8 as u8)
+					.collect(),
+				_ => indices,
+			};
+			raw
+		}
+		_ => unreachable!("unsupported data_type in encode_for_donor"),
+	}
+}
+
+/// Decode stego raw_data bytes for a given donor back to payload bytes.
+///
+/// FP32/FP16: uses `decode_chunk`.
+/// INT8/UINT8: uses the multiset permutation encoder (symbols → bits).
+pub fn decode_for_donor(
+	raw_data: &[u8],
+	data_type: i32,
+	sorted_vals: &[f32; 256],
+	sorted_idx: &[u8; 256],
+	counts: Option<&[usize; 256]>,
+	_scalar_count: usize,
+) -> Vec<u8> {
+	match data_type {
+		crate::proto::helpers::DT_FLOAT | crate::proto::helpers::DT_FLOAT16 => {
+			let floats = deserialize_floats(raw_data, data_type);
+			decode_chunk(&floats, sorted_vals, sorted_idx)
+		}
+		crate::proto::helpers::DT_INT8 | crate::proto::helpers::DT_UINT8 => {
+			let counts_ref = counts.expect("counts required for INT8/UINT8");
+			// Convert raw bytes to indices
+			let indices: Vec<u8> = match data_type {
+				crate::proto::helpers::DT_INT8 => raw_data
+					.iter()
+					.map(|&b| ((b as i8) as i16 + 128) as u8)
+					.collect(),
+				_ => raw_data.to_vec(),
+			};
+			encode_int8_block(&indices, counts_ref)
+		}
+		_ => unreachable!("unsupported data_type in decode_for_donor"),
+	}
+}
+
+/// Serialize f32 values to raw bytes for a given data_type.
+fn serialize_floats(values: &[f32], data_type: i32) -> Vec<u8> {
+	match data_type {
+		crate::proto::helpers::DT_FLOAT => {
+			let mut buf = Vec::with_capacity(values.len() * 4);
+			for &v in values {
+				buf.extend_from_slice(&v.to_le_bytes());
+			}
+			buf
+		}
+		crate::proto::helpers::DT_FLOAT16 => {
+			use crate::proto::helpers::f32_to_f16;
+			let mut buf = Vec::with_capacity(values.len() * 2);
+			for &v in values {
+				buf.extend_from_slice(&f32_to_f16(v).to_le_bytes());
+			}
+			buf
+		}
+		_ => unreachable!(),
+	}
+}
+
+/// Deserialize raw bytes to f32 values for a given data_type.
+fn deserialize_floats(raw: &[u8], data_type: i32) -> Vec<f32> {
+	match data_type {
+		crate::proto::helpers::DT_FLOAT => raw
+			.chunks_exact(4)
+			.map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+			.collect(),
+		crate::proto::helpers::DT_FLOAT16 => {
+			use crate::proto::helpers::f16_to_f32;
+			raw.chunks_exact(2)
+				.map(|chunk| {
+					let bits = u16::from_le_bytes(chunk.try_into().unwrap());
+					f16_to_f32(bits)
+				})
+				.collect()
+		}
+		_ => unreachable!(),
+	}
 }
 
 // ---------------------------------------------------------------------------

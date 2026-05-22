@@ -7,6 +7,7 @@ pub mod stego;
 use clap::Parser;
 use cli::{Cli, Commands};
 use owo_colors::OwoColorize;
+use proto::helpers;
 
 fn main() {
 	let cli = Cli::parse();
@@ -30,7 +31,6 @@ fn main() {
 			zstd_level,
 			out,
 			alpha,
-			dtype_bias,
 		} => {
 			// Read payload file
 			let payload_bytes = match std::fs::read(&payload) {
@@ -74,7 +74,7 @@ fn main() {
 					eprintln!("{} Injecting into {} …", "…".cyan(), model.display().cyan());
 				}
 
-				match stego::inject(&model, &stream, &passphrase, &out_path, alpha, dtype_bias) {
+				match stego::inject(&model, &stream, &passphrase, &out_path, alpha) {
 					Ok(()) => {
 						println!(
 							"{} {}  ({} B payload → {} B stream){}",
@@ -110,7 +110,6 @@ fn main() {
 			model,
 			passphrase,
 			out,
-			dtype_bias,
 		} => {
 			eprintln!(
 				"{} Extracting from {} …",
@@ -118,7 +117,7 @@ fn main() {
 				model.display().cyan()
 			);
 
-			match stego::extract(&model, &passphrase, dtype_bias) {
+			match stego::extract(&model, &passphrase) {
 				Ok((data, filename)) => {
 					let out_name = if filename.is_empty() {
 						"recovered_payload".to_string()
@@ -151,14 +150,10 @@ fn main() {
 				}
 			}
 		}
-		Commands::Verify {
-			model,
-			passphrase,
-			dtype_bias,
-		} => {
+		Commands::Verify { model, passphrase } => {
 			eprintln!("{} Verifying {} …", "…".cyan(), model.display().cyan());
 
-			match stego::verify(&model, &passphrase, dtype_bias) {
+			match stego::verify(&model, &passphrase) {
 				Ok(report) => {
 					if report.all_pass {
 						println!(
@@ -176,37 +171,50 @@ fn main() {
 					}
 
 					for chunk in &report.chunks {
+						let dtype_name = match chunk.donor_dtype {
+							helpers::DT_FLOAT => "FP32",
+							helpers::DT_FLOAT16 => "FP16",
+							helpers::DT_INT8 => "INT8",
+							helpers::DT_UINT8 => "UINT8",
+							_ => "?",
+						};
+
 						let status = if chunk.ks_pass && chunk.chi2_pass {
 							"✓".green().to_string()
 						} else {
 							"✗".red().to_string()
 						};
 						println!(
-							"  {} {}  (donor: {})",
+							"  {} {}  (donor: {}, {})",
 							status,
 							chunk.stego_name.cyan(),
 							chunk.donor_name.cyan(),
+							dtype_name.white(),
 						);
 
-						let ks_mark = if chunk.ks_pass {
-							"✓".green().to_string()
+						if chunk.exact_histogram_match {
+							println!("      Histogram  match exact (χ² = 0)");
 						} else {
-							"✗".red().to_string()
-						};
-						println!(
-							"      K–S   {}  D={:.6}  (crit={:.6})",
-							ks_mark, chunk.ks_stat, chunk.ks_crit
-						);
+							let ks_mark = if chunk.ks_pass {
+								"✓".green().to_string()
+							} else {
+								"✗".red().to_string()
+							};
+							println!(
+								"      K–S   {}  D={:.6}  (crit={:.6})",
+								ks_mark, chunk.ks_stat, chunk.ks_crit
+							);
 
-						let chi2_mark = if chunk.chi2_pass {
-							"✓".green().to_string()
-						} else {
-							"✗".red().to_string()
-						};
-						println!(
-							"      χ²    {}  χ²={:.2}  (crit={:.2})",
-							chi2_mark, chunk.chi2_stat, chunk.chi2_crit
-						);
+							let chi2_mark = if chunk.chi2_pass {
+								"✓".green().to_string()
+							} else {
+								"✗".red().to_string()
+							};
+							println!(
+								"      χ²    {}  χ²={:.2}  (crit={:.2})",
+								chi2_mark, chunk.chi2_stat, chunk.chi2_crit
+							);
+						}
 					}
 				}
 				Err(e) => {

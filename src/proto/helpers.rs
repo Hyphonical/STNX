@@ -22,6 +22,12 @@ pub(crate) const DT_FLOAT: i32 = 1;
 /// ONNX `TensorProto.DataType` value for `FLOAT16` (IEEE 754 half-precision).
 pub(crate) const DT_FLOAT16: i32 = 10;
 
+/// ONNX `TensorProto.DataType` value for `UINT8`.
+pub(crate) const DT_UINT8: i32 = 2;
+
+/// ONNX `TensorProto.DataType` value for `INT8`.
+pub(crate) const DT_INT8: i32 = 3;
+
 /// Minimum number of scalar elements a donor tensor must have to be eligible.
 const MIN_ELEMENTS: usize = 1024;
 
@@ -125,12 +131,16 @@ pub struct EligibleTensor {
 	pub name: String,
 	/// Shape dimensions.
 	pub dims: Vec<i64>,
-	/// ONNX data type (`1` = FLOAT, `10` = FLOAT16).
+	/// ONNX data type (`1` = FLOAT, `10` = FLOAT16, `2` = UINT8, `3` = INT8).
 	pub data_type: i32,
 	/// Total number of scalar elements (= product of dims).
 	pub scalar_count: usize,
-	/// Sorted scalar values (FP16 widened to f32).
+	/// Sorted scalar values (FP16 widened to f32). Empty for INT8/UINT8.
 	pub sorted_values: Vec<f32>,
+	/// Empirical entropy (for INT8/UINT8), 0.0 for floats.
+	pub entropy: f64,
+	/// Histogram counts (for INT8/UINT8), None for floats.
+	pub counts: Option<[usize; 256]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +148,7 @@ pub struct EligibleTensor {
 // ---------------------------------------------------------------------------
 
 /// Widen an IEEE 754 half-precision (binary16) value to f32.
-fn f16_to_f32(bit_pattern: u16) -> f32 {
+pub(crate) fn f16_to_f32(bit_pattern: u16) -> f32 {
 	let sign = ((bit_pattern >> 15) & 0x1) as i32;
 	let exp = ((bit_pattern >> 10) & 0x1F) as i32;
 	let mant = (bit_pattern & 0x3FF) as i32;
@@ -215,6 +225,31 @@ pub(crate) fn f32_to_f16(value: f32) -> u16 {
 }
 
 // ---------------------------------------------------------------------------
+// Extract mapped bytes (indices) from TensorProto for INT8/UINT8
+// ---------------------------------------------------------------------------
+
+pub(crate) fn extract_indices(tensor: &TensorProto) -> Result<Vec<u8>, ProtoError> {
+	let dt = tensor.data_type.unwrap_or(0);
+	let raw = tensor.raw_data.as_ref().ok_or_else(|| {
+		ProtoError::MissingRawData(tensor.name.as_deref().unwrap_or("<unnamed>").to_string())
+	})?;
+
+	match dt {
+		DT_UINT8 => Ok(raw.clone()),
+		DT_INT8 => {
+			let indices = raw
+				.iter()
+				.map(|&b| ((b as i8) as i16 + 128) as u8)
+				.collect();
+			Ok(indices)
+		}
+		_ => Err(ProtoError::MissingRawData(
+			tensor.name.as_deref().unwrap_or("<unnamed>").to_string(),
+		)),
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Extract scalars from TensorProto  (PLAN.md §7.1)
 // ---------------------------------------------------------------------------
 
@@ -268,9 +303,6 @@ pub fn extract_scalars(tensor: &TensorProto) -> Result<Vec<f32>, ProtoError> {
 
 pub fn is_tensor_eligible(tensor: &TensorProto) -> bool {
 	let dt = tensor.data_type.unwrap_or(0);
-	if dt != DT_FLOAT && dt != DT_FLOAT16 {
-		return false;
-	}
 
 	// Quick element count from dims
 	let scalar_count: usize = tensor.dims.iter().map(|&d| d as usize).product();
@@ -278,22 +310,43 @@ pub fn is_tensor_eligible(tensor: &TensorProto) -> bool {
 		return false;
 	}
 
-	// Try extracting scalars; if it fails, ineligible
-	let values = match extract_scalars(tensor) {
-		Ok(v) => v,
-		Err(_) => return false,
-	};
+	match dt {
+		DT_FLOAT | DT_FLOAT16 => {
+			// Try extracting scalars; if it fails, ineligible
+			let values = match extract_scalars(tensor) {
+				Ok(v) => v,
+				Err(_) => return false,
+			};
 
-	// Check distinct values
-	if values.len() < 256 {
-		return false;
+			// Check distinct values
+			if values.len() < 256 {
+				return false;
+			}
+
+			// Quick distinct-value check: sort, count distinct in one pass
+			let mut sorted = values.to_vec();
+			sorted.sort_unstable_by(|a, b| a.total_cmp(b));
+			let distinct = sorted.windows(2).filter(|w| w[0] != w[1]).count() + 1;
+			distinct >= 256
+		}
+		DT_INT8 | DT_UINT8 => {
+			// INT8/UINT8 eligibility (INT8.md §5.1)
+			let indices = match extract_indices(tensor) {
+				Ok(v) => v,
+				Err(_) => return false,
+			};
+
+			let mut counts = [0usize; 256];
+			for &idx in &indices {
+				counts[idx as usize] += 1;
+			}
+
+			// Minimum entropy check
+			let entropy = crate::stats::empirical_entropy(&counts, scalar_count);
+			entropy >= 4.0
+		}
+		_ => false,
 	}
-
-	// Quick distinct-value check: sort, count distinct in one pass
-	let mut sorted = values.to_vec();
-	sorted.sort_unstable_by(|a, b| a.total_cmp(b));
-	let distinct = sorted.windows(2).filter(|w| w[0] != w[1]).count() + 1;
-	distinct >= 256
 }
 
 pub fn eligible_initializers(model: &ModelProto) -> Vec<EligibleTensor> {
@@ -306,38 +359,69 @@ pub fn eligible_initializers(model: &ModelProto) -> Vec<EligibleTensor> {
 
 	for tensor in &graph.initializer {
 		let dt = tensor.data_type.unwrap_or(0);
-		if dt != DT_FLOAT && dt != DT_FLOAT16 {
-			continue;
-		}
-
 		let scalar_count: usize = tensor.dims.iter().map(|&d| d as usize).product();
 		if scalar_count < MIN_ELEMENTS {
 			continue;
 		}
 
-		let values = match extract_scalars(tensor) {
-			Ok(v) => v,
-			Err(_) => continue,
-		};
+		match dt {
+			DT_FLOAT | DT_FLOAT16 => {
+				let values = match extract_scalars(tensor) {
+					Ok(v) => v,
+					Err(_) => continue,
+				};
 
-		// Sort and check distinct count
-		let mut sorted = values;
-		sorted.sort_unstable_by(|a, b| a.total_cmp(b));
-		// Quick distinct count
-		let distinct = sorted.windows(2).filter(|w| w[0] != w[1]).count() + 1;
-		if distinct < 256 {
-			continue;
+				// Sort and check distinct count
+				let mut sorted = values;
+				sorted.sort_unstable_by(|a, b| a.total_cmp(b));
+				// Quick distinct count
+				let distinct = sorted.windows(2).filter(|w| w[0] != w[1]).count() + 1;
+				if distinct < 256 {
+					continue;
+				}
+
+				results.push(EligibleTensor {
+					name: tensor.name.as_deref().unwrap_or("<unnamed>").to_string(),
+					dims: tensor.dims.clone(),
+					data_type: dt,
+					scalar_count,
+					sorted_values: sorted,
+					entropy: 0.0,
+					counts: None,
+				});
+			}
+			DT_INT8 | DT_UINT8 => {
+				let indices = match extract_indices(tensor) {
+					Ok(v) => v,
+					Err(_) => continue,
+				};
+
+				let mut counts = [0usize; 256];
+				for &idx in &indices {
+					counts[idx as usize] += 1;
+				}
+
+				let entropy = crate::stats::empirical_entropy(&counts, scalar_count);
+				if entropy < 4.0 {
+					continue;
+				}
+
+				results.push(EligibleTensor {
+					name: tensor.name.as_deref().unwrap_or("<unnamed>").to_string(),
+					dims: tensor.dims.clone(),
+					data_type: dt,
+					scalar_count,
+					sorted_values: Vec::new(),
+					entropy,
+					counts: Some(counts),
+				});
+			}
+			_ => continue,
 		}
-
-		results.push(EligibleTensor {
-			name: tensor.name.as_deref().unwrap_or("<unnamed>").to_string(),
-			dims: tensor.dims.clone(),
-			data_type: dt,
-			scalar_count,
-			sorted_values: sorted,
-		});
 	}
 
+	// Sort by element count descending for Natural Ratio (INT8.md §3.2)
+	results.sort_by(|a, b| b.scalar_count.cmp(&a.scalar_count));
 	results
 }
 
@@ -357,10 +441,10 @@ pub fn max_payload_bytes(total_eligible_elements: usize, alpha: f64) -> usize {
 	(alpha * total_eligible_elements as f64).floor() as usize
 }
 
-/// Compute the disk space overhead multiplier for a set of eligible tensors.
+/// Compute the disk space overhead multiplier for eligible tensors.
 ///
-/// Returns `(fp16_count, fp32_count, avg_dtype_overhead)`.
-pub fn dtype_overhead(eligible: &[EligibleTensor]) -> (usize, usize, f64) {
+/// Returns `(fp16_el, fp32_el, int8_el, uint8_el, avg_dtype_overhead)`.
+pub fn dtype_overhead(eligible: &[EligibleTensor]) -> (usize, usize, usize, usize, f64) {
 	let fp16: usize = eligible
 		.iter()
 		.filter(|e| e.data_type == DT_FLOAT16)
@@ -371,18 +455,47 @@ pub fn dtype_overhead(eligible: &[EligibleTensor]) -> (usize, usize, f64) {
 		.filter(|e| e.data_type == DT_FLOAT)
 		.map(|e| e.scalar_count)
 		.sum();
-	let total = (fp16 + fp32) as f64;
+	let int8: usize = eligible
+		.iter()
+		.filter(|e| e.data_type == DT_INT8)
+		.map(|e| e.scalar_count)
+		.sum();
+	let uint8: usize = eligible
+		.iter()
+		.filter(|e| e.data_type == DT_UINT8)
+		.map(|e| e.scalar_count)
+		.sum();
+	let total = (fp16 + fp32 + int8 + uint8) as f64;
 	let avg = if total > 0.0 {
-		(2.0 * fp16 as f64 + 4.0 * fp32 as f64) / total
+		(2.0 * fp16 as f64 + 4.0 * fp32 as f64 + 1.0 * int8 as f64 + 1.0 * uint8 as f64) / total
 	} else {
 		0.0
 	};
-	(fp16, fp32, avg)
+	(fp16, fp32, int8, uint8, avg)
 }
 
 // ---------------------------------------------------------------------------
 // Build new TensorProto  (PLAN.md §7.2)
 // ---------------------------------------------------------------------------
+
+/// Build a new TensorProto from raw byte data.
+///
+/// `data_type` controls what gets written: FLOAT/FLOAT16 take f32 values,
+/// INT8/UINT8 take raw bytes directly.
+pub fn build_tensor_from_raw(
+	name: &str,
+	dims: &[i64],
+	data_type: i32,
+	raw_data: Vec<u8>,
+) -> TensorProto {
+	TensorProto {
+		dims: dims.to_vec(),
+		data_type: Some(data_type),
+		name: Some(name.to_string()),
+		raw_data: Some(raw_data),
+		..Default::default()
+	}
+}
 
 /// Build a new TensorProto from f32 values.
 ///
@@ -432,25 +545,29 @@ pub fn existing_initializer_names(model: &ModelProto) -> Vec<String> {
 		.unwrap_or_default()
 }
 
-/// Count distinct FP32 and FP16 initializers.
-pub fn count_by_dtype(model: &ModelProto) -> (usize, usize) {
+/// Count distinct initializers by dtype.
+pub fn count_by_dtype(model: &ModelProto) -> (usize, usize, usize, usize) {
 	let graph = match model.graph.as_ref() {
 		Some(g) => g,
-		None => return (0, 0),
+		None => return (0, 0, 0, 0),
 	};
 
 	let mut fp32 = 0usize;
 	let mut fp16 = 0usize;
+	let mut int8 = 0usize;
+	let mut uint8 = 0usize;
 
 	for t in &graph.initializer {
 		match t.data_type.unwrap_or(0) {
 			DT_FLOAT => fp32 += 1,
 			DT_FLOAT16 => fp16 += 1,
+			DT_INT8 => int8 += 1,
+			DT_UINT8 => uint8 += 1,
 			_ => {}
 		}
 	}
 
-	(fp32, fp16)
+	(fp32, fp16, int8, uint8)
 }
 
 // ---------------------------------------------------------------------------
@@ -641,9 +758,11 @@ mod tests {
 	#[test]
 	fn test_count_by_dtype_empty() {
 		let model = proto::ModelProto::default();
-		let (fp32, fp16) = count_by_dtype(&model);
+		let (fp32, fp16, int8, uint8) = count_by_dtype(&model);
 		assert_eq!(fp32, 0);
 		assert_eq!(fp16, 0);
+		assert_eq!(int8, 0);
+		assert_eq!(uint8, 0);
 	}
 
 	#[test]
@@ -683,9 +802,11 @@ mod tests {
 		let eligible = eligible_initializers(&model);
 		assert_eq!(eligible.len(), 2, "both tensors should be eligible");
 
-		let (fp32, fp16) = count_by_dtype(&model);
+		let (fp32, fp16, int8, uint8) = count_by_dtype(&model);
 		assert_eq!(fp32, 1);
 		assert_eq!(fp16, 1);
+		assert_eq!(int8, 0);
+		assert_eq!(uint8, 0);
 
 		let total = total_eligible_elements(&eligible);
 		assert_eq!(total, 2048);

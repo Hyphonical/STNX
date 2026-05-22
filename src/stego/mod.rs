@@ -1,10 +1,10 @@
 //! Constellation Encoding engine for ONNX steganography.
 //!
-//! Implements the stego tensor name generator, donor selector, profiling,
-//! injection, and extraction orchestration as specified in PLAN.md
-//! Sections 4.4, 6, and 7.1–7.3.
+//! Implements the stego tensor name generator, donor selector (Natural Ratio),
+//! profiling, injection, and extraction orchestration as specified in
+//! PLAN.md §§4.4, 6, 7.1–7.3 and INT8.md §§3, 4, 9.
 
-use crate::proto::helpers::{self, DT_FLOAT, DT_FLOAT16, EligibleTensor};
+use crate::proto::helpers::{self, DT_FLOAT, DT_FLOAT16, DT_INT8, DT_UINT8, EligibleTensor};
 use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -185,56 +185,100 @@ impl DonorSelector {
 }
 
 // ---------------------------------------------------------------------------
-// Biased donor selection  (dtype_bias flag)
+// Natural Ratio donor selection  (INT8.md §3)
 // ---------------------------------------------------------------------------
 
-/// Select a donor tensor from the eligible pool with dtype bias control.
-///
-/// `dtype_bias` is a float in [0.0, 1.0]:
-/// - 0.0 → always select FP16 donors (stego tensors are FP16)
-/// - 1.0 → always select FP32 donors (stego tensors are FP32)
-/// - 0.5 → equal chance of FP16 vs FP32 (balanced mix)
-///
-/// Each call consumes exactly 2 raw u32s from the CSPRNG (one for the pool
-/// decision, one for the index within the chosen pool), ensuring deterministic
-/// replay between injection and extraction.
-///
-/// If one pool is empty, the bias is clamped to the end that has tensors.
-fn select_donor_with_bias<'a>(
-	donor_sel: &mut DonorSelector,
-	eligible_fp16: &[&'a EligibleTensor],
-	eligible_fp32: &[&'a EligibleTensor],
-	dtype_bias: f64,
-) -> &'a EligibleTensor {
-	let (fp16_empty, fp32_empty) = (eligible_fp16.is_empty(), eligible_fp32.is_empty());
-	if fp16_empty && fp32_empty {
-		panic!("both donor pools are empty");
-	}
+/// Dtype pools for Natural Ratio selection.
+struct Pool<'a> {
+	tensors: Vec<&'a EligibleTensor>,
+	total_elements: usize,
+}
 
-	// Clamp bias based on what's available, then decide which pool to use.
-	let actual_bias = if fp16_empty {
-		1.0
-	} else if fp32_empty {
-		0.0
-	} else {
-		dtype_bias.clamp(0.0, 1.0)
-	};
-
-	let pool_choice = donor_sel.next_raw_u32();
-	let threshold = (actual_bias * u32::MAX as f64) as u32;
-	let use_fp32 = pool_choice < threshold;
-
-	if use_fp32 {
-		let idx = donor_sel.next_index(eligible_fp32.len());
-		eligible_fp32[idx]
-	} else {
-		let idx = donor_sel.next_index(eligible_fp16.len());
-		eligible_fp16[idx]
+impl<'a> Pool<'a> {
+	fn weight(&self) -> usize {
+		self.total_elements
 	}
 }
 
+/// Select the next donor using Natural Ratio demographic weighting.
+///
+/// Each call consumes exactly 1 raw u32 from the CSPRNG, ensuring
+/// deterministic replay between injection and extraction.
+///
+/// Strategy (INT8.md §3.1):
+/// 1. Compute Natural Ratio weights from per-dtype eligible elements.
+/// 2. Draw a dtype via CSPRNG using the categorical distribution.
+/// 3. Select the **largest remaining unselected** tensor from that pool.
+/// 4. If a pool is exhausted, renormalize over remaining pools.
+///
+/// # Panics
+///
+/// Panics if all pools are empty.
+fn select_donor_natural<'a>(
+	donor_sel: &mut DonorSelector,
+	pools: &mut [Pool<'a>],
+) -> &'a EligibleTensor {
+	let total_weight: usize = pools.iter().map(|p| p.weight()).sum();
+	assert!(total_weight > 0, "all donor pools are empty");
+
+	let choice = (donor_sel.next_raw_u32() as usize) % total_weight;
+	let mut cumulative = 0usize;
+
+	// Find which dtype pool was selected
+	let pool_idx = pools
+		.iter()
+		.position(|p| {
+			cumulative += p.weight();
+			choice < cumulative
+		})
+		.expect("categorical choice must fall within total weight");
+
+	// Consume the largest remaining tensor from the chosen pool
+	let pool = &mut pools[pool_idx];
+	if pool.tensors.is_empty() {
+		// Pool exhausted; renormalize: zero out and retry
+		pool.total_elements = 0;
+		return select_donor_natural(donor_sel, pools);
+	}
+
+	// Descending-size order means tensors[0] is the largest remaining
+	let result = pool.tensors.remove(0);
+	// Update pool weight (recompute from remaining tensors)
+	pool.total_elements = pool.tensors.iter().map(|t| t.scalar_count).sum();
+	result
+}
+
+/// Build dtype pools for Natural Ratio selection.
+fn build_pools<'a>(eligible: &'a [EligibleTensor]) -> Vec<Pool<'a>> {
+	let fp32: Vec<&EligibleTensor> = eligible
+		.iter()
+		.filter(|e| e.data_type == DT_FLOAT)
+		.collect();
+	let fp16: Vec<&EligibleTensor> = eligible
+		.iter()
+		.filter(|e| e.data_type == DT_FLOAT16)
+		.collect();
+	let int8: Vec<&EligibleTensor> = eligible.iter().filter(|e| e.data_type == DT_INT8).collect();
+	let uint8: Vec<&EligibleTensor> = eligible
+		.iter()
+		.filter(|e| e.data_type == DT_UINT8)
+		.collect();
+
+	let mut pools = Vec::new();
+	for tensors in [fp32, fp16, int8, uint8] {
+		if !tensors.is_empty() {
+			let total_elements = tensors.iter().map(|t| t.scalar_count).sum();
+			pools.push(Pool {
+				tensors,
+				total_elements,
+			});
+		}
+	}
+	pools
+}
+
 // ---------------------------------------------------------------------------
-// Profile  (PLAN.md §7.1)
+// Profile  (PLAN.md §7.1 + INT8.md §5.4)
 // ---------------------------------------------------------------------------
 
 /// Profile a donor ONNX model and return a capacity report string.
@@ -243,35 +287,31 @@ pub fn profile(model_path: &Path, alpha: f64) -> Result<String, Box<dyn std::err
 	let eligible = helpers::eligible_initializers(&model);
 
 	if eligible.is_empty() {
-		return Err("No eligible FP32 or FP16 tensors found".into());
+		return Err("No eligible tensors found (FP32, FP16, INT8, or UINT8)".into());
 	}
 
 	let total_el = helpers::total_eligible_elements(&eligible);
 	let max_payload = helpers::max_payload_bytes(total_el, alpha);
-	let (fp32_eligible_count, fp16_eligible_count) = {
-		let fp32 = eligible.iter().filter(|e| e.data_type == DT_FLOAT).count();
-		let fp16 = eligible
+
+	// Count per-dtype
+	let macros = |dt: i32| {
+		let count = eligible.iter().filter(|e| e.data_type == dt).count();
+		let el: usize = eligible
 			.iter()
-			.filter(|e| e.data_type == DT_FLOAT16)
-			.count();
-		(fp32, fp16)
+			.filter(|e| e.data_type == dt)
+			.map(|e| e.scalar_count)
+			.sum();
+		(count, el)
 	};
+	let (fp32_cnt, fp32_el) = macros(DT_FLOAT);
+	let (fp16_cnt, fp16_el) = macros(DT_FLOAT16);
+	let (int8_cnt, int8_el) = macros(DT_INT8);
+	let (uint8_cnt, uint8_el) = macros(DT_UINT8);
 
-	// Count FP16 vs FP32 eligible elements
-	let fp32_el: usize = eligible
-		.iter()
-		.filter(|e| e.data_type == DT_FLOAT)
-		.map(|e| e.scalar_count)
-		.sum();
-	let fp16_el: usize = eligible
-		.iter()
-		.filter(|e| e.data_type == DT_FLOAT16)
-		.map(|e| e.scalar_count)
-		.sum();
-
-	// Disk overhead
+	// Disk overhead (INT8.md §8.1)
 	let disk_multiplier = if total_el > 0 {
-		(2.0 * fp16_el as f64 + 4.0 * fp32_el as f64) / total_el as f64
+		(4.0 * fp32_el as f64 + 2.0 * fp16_el as f64 + 1.0 * int8_el as f64 + 1.0 * uint8_el as f64)
+			/ total_el as f64
 	} else {
 		0.0
 	};
@@ -279,54 +319,97 @@ pub fn profile(model_path: &Path, alpha: f64) -> Result<String, Box<dyn std::err
 	let projected_payload_mb = (max_payload as f64) / (1024.0 * 1024.0);
 	let projected_disk_mb = projected_payload_mb * disk_multiplier;
 
-	let w = 30; // label width
-	let report = format!(
-		"{}\n  {} {} {}\n  {} {} {}\n  {} {}\n  {} {:.1}x{}\n  {} ~{:.1} MB{}\n  {} ~{:.1} MB{}",
-		"Profile complete.".blue().bold(),
-		format!("{:w$} :", "Eligible FP32 tensors", w = w).blue(),
-		fmt_count(fp32_eligible_count).white(),
-		format!("(total elements: {})", fmt_count(fp32_el)).dimmed(),
-		format!("{:w$} :", "Eligible FP16 tensors", w = w).blue(),
-		fmt_count(fp16_eligible_count).white(),
-		format!("(total elements: {})", fmt_count(fp16_el)).dimmed(),
-		format!("{:w$} :", "Combined eligible elements", w = w).blue(),
+	// Natural Ratio percentages (INT8.md §3.1)
+	let ratio_str = if total_el > 0 {
+		format!(
+			"FP32 {:.1}% | FP16 {:.1}% | INT8 {:.1}% | UINT8 {:.1}%",
+			fp32_el as f64 / total_el as f64 * 100.0,
+			fp16_el as f64 / total_el as f64 * 100.0,
+			int8_el as f64 / total_el as f64 * 100.0,
+			uint8_el as f64 / total_el as f64 * 100.0,
+		)
+	} else {
+		"N/A".to_string()
+	};
+
+	let mut lines = vec!["Profile complete.".blue().bold().to_string()];
+
+	if fp32_cnt > 0 {
+		lines.push(format!(
+			"  {:30} : {} {}",
+			"Eligible FP32 tensors".blue(),
+			fmt_count(fp32_cnt).white(),
+			format!("(total elements: {})", fmt_count(fp32_el)).dimmed(),
+		));
+	}
+	if fp16_cnt > 0 {
+		lines.push(format!(
+			"  {:30} : {} {}",
+			"Eligible FP16 tensors".blue(),
+			fmt_count(fp16_cnt).white(),
+			format!("(total elements: {})", fmt_count(fp16_el)).dimmed(),
+		));
+	}
+	if int8_cnt > 0 {
+		lines.push(format!(
+			"  {:30} : {} {}",
+			"Eligible INT8 tensors".blue(),
+			fmt_count(int8_cnt).white(),
+			format!("(total elements: {}, entropy≥4.0)", fmt_count(int8_el)).dimmed(),
+		));
+	}
+	if uint8_cnt > 0 {
+		lines.push(format!(
+			"  {:30} : {} {}",
+			"Eligible UINT8 tensors".blue(),
+			fmt_count(uint8_cnt).white(),
+			format!("(total elements: {}, entropy≥4.0)", fmt_count(uint8_el)).dimmed(),
+		));
+	}
+
+	lines.push(format!(
+		"  {:30} : {}",
+		"Combined eligible elements".blue(),
 		fmt_count(total_el).white(),
-		format!("{:w$} :", "Effective disk overhead", w = w).blue(),
+	));
+	lines.push(format!(
+		"  {:30} : Natural Ratio (by element)   {}",
+		"".blue(),
+		ratio_str.white(),
+	));
+	lines.push(format!(
+		"  {:30} : {:.1}x{}",
+		"Effective disk overhead".blue(),
 		disk_multiplier,
 		" payload bytes".white(),
-		format!(
-			"{:w$} :",
-			format!("Projected capacity @ {:.0}%", alpha * 100.0),
-			w = w
-		)
-		.blue(),
+	));
+	lines.push(format!(
+		"  {:30} : ~{:.1} MB{}",
+		format!("Projected capacity @ {:.0}%", alpha * 100.0).blue(),
 		projected_payload_mb,
 		" payload".white(),
-		format!("{:w$} :", "", w = w).blue(),
+	));
+	lines.push(format!(
+		"  {:30} : ~{:.1} MB{}",
+		"".blue(),
 		projected_disk_mb,
-		" disk overhead".white()
-	);
+		" disk overhead".white(),
+	));
 
-	Ok(report)
+	Ok(lines.join("\n"))
 }
 
 // ---------------------------------------------------------------------------
-// Inject  (PLAN.md §7.2)
+// Inject  (PLAN.md §7.2 + INT8.md §9.2)
 // ---------------------------------------------------------------------------
 
 /// Inject a payload into a donor ONNX model.
-///
-/// `dtype_bias` controls the FP32 vs FP16 donor mix:
-/// - 0.0 → only FP16 donors (stego tensors are FP16)
-/// - 1.0 → only FP32 donors (stego tensors are FP32)
-/// - 0.5 → balanced mix (default)
 pub fn inject(
 	model_path: &Path,
 	payload: &[u8],
 	passphrase: &str,
 	out_path: &Path,
 	alpha: f64,
-	dtype_bias: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
 	let subkeys = crate::crypto::derive_subkeys(passphrase)?;
 	let mut model = helpers::load_model(model_path)?;
@@ -334,10 +417,10 @@ pub fn inject(
 	let existing_names = helpers::existing_initializer_names(&model);
 
 	if eligible.is_empty() {
-		return Err("No eligible FP32 or FP16 tensors found".into());
+		return Err("No eligible tensors found (FP32, FP16, INT8, or UINT8)".into());
 	}
 
-	// ── Capacity check (PLAN.md §9.1) ──
+	// ── Capacity check ──
 	let total_el = helpers::total_eligible_elements(&eligible);
 	let max_payload = helpers::max_payload_bytes(total_el, alpha);
 	if payload.len() > max_payload {
@@ -351,18 +434,10 @@ pub fn inject(
 		.into());
 	}
 
-	// Split eligible into FP16 and FP32 pools for biased donor selection
-	let fp16_pool: Vec<&EligibleTensor> = eligible
-		.iter()
-		.filter(|e| e.data_type == DT_FLOAT16)
-		.collect();
-	let fp32_pool: Vec<&EligibleTensor> = eligible
-		.iter()
-		.filter(|e| e.data_type == DT_FLOAT)
-		.collect();
-
-	if fp16_pool.is_empty() && fp32_pool.is_empty() {
-		return Err("No eligible FP32 or FP16 tensors found".into());
+	// Build Natural Ratio pools (sorted descending already by eligible_initializers)
+	let mut pools = build_pools(&eligible);
+	if pools.is_empty() {
+		return Err("No eligible tensors found (FP32, FP16, INT8, or UINT8)".into());
 	}
 
 	let mut name_gen = NameGenerator::new(&subkeys.name);
@@ -373,111 +448,116 @@ pub fn inject(
 	let mut stego_tensors = Vec::new();
 
 	while bytes_consumed < total_payload_bytes {
-		// Pick the next donor with dtype bias control
-		let donor = select_donor_with_bias(&mut donor_sel, &fp16_pool, &fp32_pool, dtype_bias);
+		let donor = select_donor_natural(&mut donor_sel, &mut pools);
 
-		// Build ECDF table
-		let table = crate::stats::build_ecdf_table(&donor.sorted_values)
-			.ok_or("Donor failed ECDF table construction")?;
-
-		// Determine chunk size (one per element)
-		let chunk_size = donor.scalar_count;
-		let end = (bytes_consumed + chunk_size).min(payload.len());
-
-		// Get the bytes for this chunk
-		let chunk_bytes = &payload[bytes_consumed..end];
-
-		// Encode using the ECDF table
-		let encoded = crate::stats::encode_chunk(chunk_bytes, &table);
-
-		// Pad if needed (PLAN.md §4.2.4)
-		let combined = if encoded.len() < chunk_size {
-			let pad_key = &subkeys.pad;
-			let mut pad_rng = crate::stats::PaddingRng::new(pad_key);
-			let pad_len = chunk_size - encoded.len();
-			let pad_bytes = pad_rng.generate(pad_len);
-			let pad_encoded = crate::stats::encode_chunk(&pad_bytes, &table);
-			let mut c = encoded;
-			c.extend_from_slice(&pad_encoded);
-			c
-		} else {
-			encoded
-		};
-
-		// Build stego tensor
-		let name = name_gen.next_name(&existing_names);
-		let stego = helpers::build_tensor(&name, &donor.dims, donor.data_type, &combined);
-
-		// ── Verification gate (PLAN.md §10.2) ──
-
-		// Both the K–S test and χ² test compare the encoded chunk against a
-		// synthetic same-sized sample drawn from the *same ECDF table* (not
-		// the full donor population).  This is the correct null hypothesis:
-		//   H₀: the stego chunk is a valid sample from the ECDF table.
-		//
-		// Comparing against the full donor population would be too sensitive,
-		// because the ECDF table is a 256-value discretization of the donor's
-		// continuous distribution.  A 256-value sample is measurably different
-		// from the full continuous population even though every individual
-		// value is legitimate — the staircase shape of the 256-point ECDF is
-		// detectable by K–S on large donors.
-
-		let num_elements = combined.len();
-		let mut pad_rng = crate::stats::PaddingRng::new(&subkeys.pad);
-		let synth_bytes = pad_rng.generate(num_elements);
-		let synth_encoded = crate::stats::encode_chunk(&synth_bytes, &table);
-
-		// K–S test: encoded floats vs synthetic ECDF sample
-		let stego_f64: Vec<f64> = combined.iter().map(|&f| f as f64).collect();
-		let synth_f64: Vec<f64> = synth_encoded.iter().map(|&f| f as f64).collect();
-		let ks_stat = crate::stats::ks_statistic(&stego_f64, &synth_f64);
-		let ks_crit = crate::stats::ks_critical_value_005(stego_f64.len(), synth_f64.len());
-		if ks_stat > ks_crit {
-			return Err(format!(
-				"K–S test failed for chunk at donor '{}' (D={:.6}, crit={:.6})",
-				donor.name, ks_stat, ks_crit
-			)
-			.into());
-		}
-
-		// Chi-squared byte-frequency test
-		let raw_data = stego.raw_data.as_deref().unwrap_or_default();
-		let obs_freqs = crate::stats::byte_frequencies(raw_data);
-
-		let mut exp_freqs = [0.0f64; 256];
-		let expected_count_per_entry = num_elements as f64 / 256.0;
 		match donor.data_type {
-			helpers::DT_FLOAT => {
-				for &v in table.iter() {
-					for b in v.to_le_bytes() {
-						exp_freqs[b as usize] += expected_count_per_entry;
-					}
+			DT_FLOAT | DT_FLOAT16 => {
+				// ECDF path
+				let table = crate::stats::build_ecdf_table(&donor.sorted_values)
+					.ok_or("Donor failed ECDF table construction")?;
+
+				let chunk_size = donor.scalar_count;
+				let end = (bytes_consumed + chunk_size).min(payload.len());
+				let chunk_bytes = &payload[bytes_consumed..end];
+
+				let encoded = crate::stats::encode_chunk(chunk_bytes, &table);
+
+				let combined = if encoded.len() < chunk_size {
+					let mut pad_rng = crate::stats::PaddingRng::new(&subkeys.pad);
+					let pad_len = chunk_size - encoded.len();
+					let pad_bytes = pad_rng.generate(pad_len);
+					let pad_encoded = crate::stats::encode_chunk(&pad_bytes, &table);
+					let mut c = encoded;
+					c.extend_from_slice(&pad_encoded);
+					c
+				} else {
+					encoded
+				};
+
+				let stego_name = name_gen.next_name(&existing_names);
+				let stego =
+					helpers::build_tensor(&stego_name, &donor.dims, donor.data_type, &combined);
+
+				// ── Verification gates (PLAN.md §10.2) ──
+				let num_elements = combined.len();
+				let mut pad_rng = crate::stats::PaddingRng::new(&subkeys.pad);
+				let synth_bytes = pad_rng.generate(num_elements);
+				let synth_encoded = crate::stats::encode_chunk(&synth_bytes, &table);
+
+				let stego_f64: Vec<f64> = combined.iter().map(|&f| f as f64).collect();
+				let synth_f64: Vec<f64> = synth_encoded.iter().map(|&f| f as f64).collect();
+				let ks_stat = crate::stats::ks_statistic(&stego_f64, &synth_f64);
+				let ks_crit = crate::stats::ks_critical_value_005(stego_f64.len(), synth_f64.len());
+				if ks_stat > ks_crit {
+					return Err(format!(
+						"K–S test failed for chunk at donor '{}' (D={:.6}, crit={:.6})",
+						donor.name, ks_stat, ks_crit
+					)
+					.into());
 				}
-			}
-			helpers::DT_FLOAT16 => {
-				for &v in table.iter() {
-					for b in helpers::f32_to_f16(v).to_le_bytes() {
-						exp_freqs[b as usize] += expected_count_per_entry;
+
+				// Chi-squared byte-frequency test
+				let raw = stego.raw_data.as_deref().unwrap_or_default();
+				let obs_freqs = crate::stats::byte_frequencies(raw);
+
+				let mut exp_freqs = [0.0f64; 256];
+				let expected_count_per_entry = num_elements as f64 / 256.0;
+				match donor.data_type {
+					DT_FLOAT => {
+						for &v in table.iter() {
+							for b in v.to_le_bytes() {
+								exp_freqs[b as usize] += expected_count_per_entry;
+							}
+						}
 					}
+					DT_FLOAT16 => {
+						for &v in table.iter() {
+							for b in helpers::f32_to_f16(v).to_le_bytes() {
+								exp_freqs[b as usize] += expected_count_per_entry;
+							}
+						}
+					}
+					_ => unreachable!(),
 				}
+
+				let chi2_stat = crate::stats::chi_squared_byte_test(&obs_freqs, &exp_freqs);
+				if chi2_stat > crate::stats::CHI_SQUARED_CRITICAL_005 {
+					return Err(format!(
+						"χ² test failed for chunk at donor '{}' (χ²={:.2}, crit={:.2})",
+						donor.name,
+						chi2_stat,
+						crate::stats::CHI_SQUARED_CRITICAL_005
+					)
+					.into());
+				}
+
+				bytes_consumed = end;
+				stego_tensors.push(stego);
 			}
-			_ => unreachable!("unexpected donor data_type"),
-		}
+			DT_INT8 | DT_UINT8 => {
+				// Multiset permutation path (INT8.md §4)
+				let chunk_size = donor.scalar_count;
+				let end = (bytes_consumed + chunk_size).min(payload.len());
+				let chunk_bytes = &payload[bytes_consumed..end];
 
-		let chi2_stat = crate::stats::chi_squared_byte_test(&obs_freqs, &exp_freqs);
-		if chi2_stat > crate::stats::CHI_SQUARED_CRITICAL_005 {
-			return Err(format!(
-				"χ² test failed for chunk at donor '{}' (χ²={:.2}, crit={:.2})",
-				donor.name,
-				chi2_stat,
-				crate::stats::CHI_SQUARED_CRITICAL_005
-			)
-			.into());
-		}
+				let raw = crate::stats::encode_for_donor(
+					chunk_bytes,
+					&subkeys.pad,
+					donor.data_type,
+					&[0.0f32; 256], // unused for INT8
+					donor.counts.as_ref(),
+					chunk_size,
+				);
 
-		stego_tensors.push(stego);
+				let stego_name = name_gen.next_name(&existing_names);
+				let stego =
+					helpers::build_tensor_from_raw(&stego_name, &donor.dims, donor.data_type, raw);
 
-		bytes_consumed = end;
+				bytes_consumed = end;
+				stego_tensors.push(stego);
+			}
+			_ => unreachable!("unsupported data_type"),
+		};
 	}
 
 	// Append stego tensors to model
@@ -491,19 +571,14 @@ pub fn inject(
 	Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Extract  (PLAN.md §6 + INT8.md §9.3)
+// ---------------------------------------------------------------------------
+
 /// Extract a hidden payload from a stego ONNX model.
-///
-/// Follows PLAN.md §6 extraction algorithm exactly.
-/// The name CSPRNG reproduces the same sequence as injection. Names that
-/// collide with the original donor model are skipped. Names that make it
-/// through and exist in the stego model are stego tensors.
-///
-/// `dtype_bias` must match the value used during injection for correct
-/// deterministic donor selection.  Default for new stego models is 0.5.
 pub fn extract(
 	model_path: &Path,
 	passphrase: &str,
-	dtype_bias: f64,
 ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
 	let subkeys = crate::crypto::derive_subkeys(passphrase)?;
 	let model = helpers::load_model(model_path)?;
@@ -513,19 +588,7 @@ pub fn extract(
 	let all_name_set: std::collections::HashSet<&str> =
 		all_names.iter().map(|s| s.as_str()).collect();
 
-	// Step 2-3: regenerate the name CSPRNG sequence.
-	//
-	// During injection, names that collided with original donor names were
-	// skipped (advance past). During extraction, we discover which names
-	// were skipped by generating the raw sequence:
-	//
-	//   - If the generated name exists in M → it's a stego tensor S.
-	//   - If it does NOT exist in M → it was skipped during injection
-	//     (collided with a donor name); we skip it now by adding to the
-	//     avoidance set.
-	//
-	// The avoidance set tracks all names we've seen, ensuring the CSPRNG
-	// advances past them identically to injection.
+	// Step 2-3: regenerate the name CSPRNG sequence
 	let mut name_gen = NameGenerator::new(&subkeys.name);
 	let mut stego_set: Vec<String> = Vec::new();
 	let mut used_names: Vec<String> = Vec::new();
@@ -534,13 +597,10 @@ pub fn extract(
 		let candidate = name_gen.next_name(&used_names);
 
 		if all_name_set.contains(candidate.as_str()) {
-			// Exists in model → it's a stego tensor
 			stego_set.push(candidate.clone());
 		}
-		// Track used names to reproduce the same CSPRNG advancement
 		used_names.push(candidate);
 
-		// Early stop: we can't have more stego tensors than total names
 		if stego_set.len() >= all_names.len() {
 			break;
 		}
@@ -550,7 +610,7 @@ pub fn extract(
 		return Err("No stego tensors found — wrong passphrase?".into());
 	}
 
-	// Step 3 (continued): donor pool R = M \ S (eligible FP32/FP16 only)
+	// Step 3 (continued): donor pool R = M \ S
 	let all_eligible = helpers::eligible_initializers(&model);
 	let donor_vec: Vec<EligibleTensor> = all_eligible
 		.into_iter()
@@ -561,29 +621,17 @@ pub fn extract(
 		return Err("Donor pool is empty".into());
 	}
 
-	// Split into FP16/FP32 pools for biased donor selection
-	let fp16_pool: Vec<&EligibleTensor> = donor_vec
-		.iter()
-		.filter(|e| e.data_type == DT_FLOAT16)
-		.collect();
-	let fp32_pool: Vec<&EligibleTensor> = donor_vec
-		.iter()
-		.filter(|e| e.data_type == DT_FLOAT)
-		.collect();
-
-	if fp16_pool.is_empty() && fp32_pool.is_empty() {
-		return Err("Donor pool has no eligible FP32 or FP16 tensors".into());
+	let mut pools = build_pools(&donor_vec);
+	if pools.is_empty() {
+		return Err("Donor pool has no eligible tensors".into());
 	}
 
-	// Step 4-5: decode chunks using K_profile donor sequence
+	// Step 4-5: decode chunks using Natural Ratio donor sequence
 	let mut decoded_bytes = Vec::new();
 	let mut donor_sel = DonorSelector::new(&subkeys.profile);
 
 	for stego_name in &stego_set {
-		let donor = select_donor_with_bias(&mut donor_sel, &fp16_pool, &fp32_pool, dtype_bias);
-
-		let (sorted_vals, sorted_idx) = crate::stats::build_sorted_ecdf_table(&donor.sorted_values)
-			.ok_or("Donor failed sorted ECDF table construction")?;
+		let donor = select_donor_natural(&mut donor_sel, &mut pools);
 
 		let stego_tensor = model
 			.graph
@@ -595,93 +643,92 @@ pub fn extract(
 			})
 			.ok_or("Stego tensor not found in model")?;
 
-		let floats = helpers::extract_scalars(stego_tensor)?;
-		let chunk = crate::stats::decode_chunk(&floats, &sorted_vals, &sorted_idx);
-		decoded_bytes.extend_from_slice(&chunk);
+		match donor.data_type {
+			DT_FLOAT | DT_FLOAT16 => {
+				let (sorted_vals, sorted_idx) =
+					crate::stats::build_sorted_ecdf_table(&donor.sorted_values)
+						.ok_or("Donor failed sorted ECDF table construction")?;
+
+				let floats = helpers::extract_scalars(stego_tensor)?;
+				let chunk = crate::stats::decode_chunk(&floats, &sorted_vals, &sorted_idx);
+				decoded_bytes.extend_from_slice(&chunk);
+			}
+			DT_INT8 | DT_UINT8 => {
+				let raw_data = stego_tensor
+					.raw_data
+					.as_deref()
+					.ok_or("Stego tensor has no raw_data")?;
+				let chunk = crate::stats::decode_for_donor(
+					raw_data,
+					donor.data_type,
+					&[0.0; 256],
+					&[0; 256],
+					donor.counts.as_ref(),
+					donor.scalar_count,
+				);
+				decoded_bytes.extend_from_slice(&chunk);
+			}
+			_ => unreachable!("unsupported data_type"),
+		}
 	}
 
-	// Step 6: decrypt — also return the filename from the header
+	// Step 6: decrypt
 	let (file_data, filename) = crate::crypto::decrypt_payload(&decoded_bytes, &subkeys.enc)
 		.map_err(|e| format!("Decryption failed: {e}"))?;
 	Ok((file_data, filename))
 }
 
 // ---------------------------------------------------------------------------
-// Verify  (PLAN.md §8, §10)
+// Verify  (PLAN.md §8, §10 + INT8.md §7)
 // ---------------------------------------------------------------------------
 
 /// Result of verifying a single stego chunk.
 #[derive(Debug, Clone)]
 pub struct ChunkReport {
-	/// Name of the stego tensor.
 	pub stego_name: String,
-	/// Name of the donor tensor.
 	pub donor_name: String,
-	/// Whether the K–S test passed (same distribution not rejected).
+	pub donor_dtype: i32,
 	pub ks_pass: bool,
-	/// The K–S D statistic.
 	pub ks_stat: f64,
-	/// The K–S critical value at α = 0.05.
 	pub ks_crit: f64,
-	/// Whether the chi-squared byte-frequency test passed.
 	pub chi2_pass: bool,
-	/// The chi-squared statistic.
 	pub chi2_stat: f64,
-	/// The chi-squared critical value at α = 0.05.
 	pub chi2_crit: f64,
+	pub exact_histogram_match: bool,
 }
 
 /// Summary of a full verification run.
 #[derive(Debug)]
 pub struct VerifyReport {
-	/// Reports for each chunk.
 	pub chunks: Vec<ChunkReport>,
-	/// Whether every chunk passed all statistical gates.
 	pub all_pass: bool,
-	/// Total number of chunks tested.
 	pub total_chunks: usize,
-	/// Number of chunks that failed any gate.
 	pub failed_chunks: usize,
 }
 
 /// Verify the statistical integrity of a stego ONNX model.
-///
-/// Follows PLAN.md §8 and §10.2:
-/// - Discovers stego tensors via the name CSPRNG (same algorithm as extraction).
-/// - For each stego chunk, builds the ECDF table from its assigned donor and
-///   runs the two-sample K–S test (α = 0.05) and chi-squared byte-frequency
-///   test (α = 0.05) on the chunk's raw bytes.
-///
-/// `dtype_bias` must match the value used during injection for correct
-/// deterministic donor replay.  Default for new stego models is 0.5.
-///
-/// This command is purely analytical — it never writes or modifies a file.
 pub fn verify(
 	model_path: &Path,
 	passphrase: &str,
-	dtype_bias: f64,
 ) -> Result<VerifyReport, Box<dyn std::error::Error>> {
 	let subkeys = crate::crypto::derive_subkeys(passphrase)?;
 	let model = helpers::load_model(model_path)?;
 
-	// ── Step 1: discover stego tensors ──
+	// ── Discover stego tensors ──
 	let all_names = helpers::existing_initializer_names(&model);
 	let all_name_set: std::collections::HashSet<&str> =
 		all_names.iter().map(|s| s.as_str()).collect();
 
-	// Regenerate the name CSPRNG sequence identically to injection/extraction.
 	let mut name_gen = NameGenerator::new(&subkeys.name);
 	let mut stego_set: Vec<String> = Vec::new();
 	let mut used_names: Vec<String> = Vec::new();
 
 	for _ in 0..all_names.len().max(1) * 4 {
 		let candidate = name_gen.next_name(&used_names);
-
 		if all_name_set.contains(candidate.as_str()) {
 			stego_set.push(candidate.clone());
 		}
 		used_names.push(candidate);
-
 		if stego_set.len() >= all_names.len() {
 			break;
 		}
@@ -691,10 +738,10 @@ pub fn verify(
 		return Err("No stego tensors found — wrong passphrase?".into());
 	}
 
-	// ── Step 2: build donor pool R = M \ S ──
+	// ── Build donor pool R = M \ S ──
 	let all_eligible = helpers::eligible_initializers(&model);
-	let donor_vec: Vec<&EligibleTensor> = all_eligible
-		.iter()
+	let donor_vec: Vec<EligibleTensor> = all_eligible
+		.into_iter()
 		.filter(|e| !stego_set.contains(&e.name))
 		.collect();
 
@@ -702,98 +749,125 @@ pub fn verify(
 		return Err("Donor pool is empty".into());
 	}
 
-	// Split into FP16/FP32 pools for biased selection
-	let fp16_pool: Vec<&EligibleTensor> = donor_vec
-		.iter()
-		.filter(|e| e.data_type == DT_FLOAT16)
-		.copied()
-		.collect();
-	let fp32_pool: Vec<&EligibleTensor> = donor_vec
-		.iter()
-		.filter(|e| e.data_type == DT_FLOAT)
-		.copied()
-		.collect();
+	let mut pools = build_pools(&donor_vec);
 
-	// ── Step 3: verify each chunk ──
+	// ── Verify each chunk ──
 	let graph = model.graph.as_ref().ok_or("Model has no graph")?;
-
 	let mut donor_sel = DonorSelector::new(&subkeys.profile);
 	let mut chunks = Vec::new();
-
 	let chi2_crit = crate::stats::CHI_SQUARED_CRITICAL_005;
 
 	for stego_name in &stego_set {
-		let donor = select_donor_with_bias(&mut donor_sel, &fp16_pool, &fp32_pool, dtype_bias);
+		let donor = select_donor_natural(&mut donor_sel, &mut pools);
 
-		// Find the stego tensor in the model
 		let stego_tensor = graph
 			.initializer
 			.iter()
 			.find(|t| t.name.as_deref() == Some(stego_name))
-			.ok_or_else(|| format!("Stego tensor '{}' not found in model", stego_name))?;
+			.ok_or_else(|| format!("Stego tensor '{}' not found", stego_name))?;
 
-		// Build ECDF table from donor
-		let table = crate::stats::build_ecdf_table(&donor.sorted_values)
-			.ok_or_else(|| format!("Donor '{}' failed ECDF table construction", donor.name))?;
-
-		// Extract stego floats
-		let stego_floats = helpers::extract_scalars(stego_tensor)?;
-		let num_elements = stego_floats.len();
-
-		// Generate a same-sized synthetic ECDF sample for comparison.
-		// We compare against an ECDF sample (not the full donor population)
-		// because the 256-value ECDF discretization is a deliberately coarse
-		// approximation.  The null hypothesis is that the stego chunk is
-		// statistically indistinguishable from another sample drawn from the
-		// *same* ECDF table — not from the full continuous donor distribution.
-		let mut pad_rng = crate::stats::PaddingRng::new(&subkeys.pad);
-		let synth_bytes = pad_rng.generate(num_elements);
-		let synth_encoded = crate::stats::encode_chunk(&synth_bytes, &table);
-
-		// K–S test: stego floats vs synthetic ECDF sample
-		let stego_f64: Vec<f64> = stego_floats.iter().map(|&f| f as f64).collect();
-		let synth_f64: Vec<f64> = synth_encoded.iter().map(|&f| f as f64).collect();
-		let ks_stat = crate::stats::ks_statistic(&stego_f64, &synth_f64);
-		let ks_crit = crate::stats::ks_critical_value_005(stego_f64.len(), synth_f64.len());
-		let ks_pass = ks_stat <= ks_crit;
-
-		// Chi-squared byte-frequency test on raw_data
-		let raw_data = stego_tensor.raw_data.as_deref().unwrap_or_default();
-		let obs_freqs = crate::stats::byte_frequencies(raw_data);
-
-		let mut exp_freqs = [0.0f64; 256];
-		let expected_count_per_entry = num_elements as f64 / 256.0;
 		match donor.data_type {
-			helpers::DT_FLOAT => {
-				for &v in table.iter() {
-					for b in v.to_le_bytes() {
-						exp_freqs[b as usize] += expected_count_per_entry;
+			DT_FLOAT | DT_FLOAT16 => {
+				let table = crate::stats::build_ecdf_table(&donor.sorted_values)
+					.ok_or_else(|| format!("Donor '{}' failed ECDF", donor.name))?;
+
+				let stego_floats = helpers::extract_scalars(stego_tensor)?;
+				let num_elements = stego_floats.len();
+
+				let mut pad_rng = crate::stats::PaddingRng::new(&subkeys.pad);
+				let synth_bytes = pad_rng.generate(num_elements);
+				let synth_encoded = crate::stats::encode_chunk(&synth_bytes, &table);
+
+				let stego_f64: Vec<f64> = stego_floats.iter().map(|&f| f as f64).collect();
+				let synth_f64: Vec<f64> = synth_encoded.iter().map(|&f| f as f64).collect();
+				let ks_stat = crate::stats::ks_statistic(&stego_f64, &synth_f64);
+				let ks_crit = crate::stats::ks_critical_value_005(stego_f64.len(), synth_f64.len());
+				let ks_pass = ks_stat <= ks_crit;
+
+				let raw_data = stego_tensor.raw_data.as_deref().unwrap_or_default();
+				let obs_freqs = crate::stats::byte_frequencies(raw_data);
+
+				let mut exp_freqs = [0.0f64; 256];
+				let expected_count_per_entry = num_elements as f64 / 256.0;
+				match donor.data_type {
+					DT_FLOAT => {
+						for &v in table.iter() {
+							for b in v.to_le_bytes() {
+								exp_freqs[b as usize] += expected_count_per_entry;
+							}
+						}
 					}
-				}
-			}
-			helpers::DT_FLOAT16 => {
-				for &v in table.iter() {
-					for b in helpers::f32_to_f16(v).to_le_bytes() {
-						exp_freqs[b as usize] += expected_count_per_entry;
+					DT_FLOAT16 => {
+						for &v in table.iter() {
+							for b in helpers::f32_to_f16(v).to_le_bytes() {
+								exp_freqs[b as usize] += expected_count_per_entry;
+							}
+						}
 					}
+					_ => unreachable!(),
 				}
+
+				let chi2_stat = crate::stats::chi_squared_byte_test(&obs_freqs, &exp_freqs);
+				let chi2_pass = chi2_stat <= chi2_crit;
+
+				chunks.push(ChunkReport {
+					stego_name: stego_name.clone(),
+					donor_name: donor.name.clone(),
+					donor_dtype: donor.data_type,
+					ks_pass,
+					ks_stat,
+					ks_crit,
+					chi2_pass,
+					chi2_stat,
+					chi2_crit,
+					exact_histogram_match: false,
+				});
 			}
-			_ => unreachable!("unexpected donor data_type"),
+			DT_INT8 | DT_UINT8 => {
+				// Exact histogram match (INT8.md §7.2)
+				let counts_ref = donor.counts.as_ref().expect("counts required");
+				let raw_data = stego_tensor
+					.raw_data
+					.as_deref()
+					.ok_or("Stego tensor missing raw_data")?;
+
+				let indices: Vec<u8> = match donor.data_type {
+					DT_INT8 => raw_data
+						.iter()
+						.map(|&b| ((b as i8) as i16 + 128) as u8)
+						.collect(),
+					_ => raw_data.to_vec(),
+				};
+
+				let mut obs_counts = [0usize; 256];
+				for &idx in &indices {
+					obs_counts[idx as usize] += 1;
+				}
+
+				let exact_match = counts_ref == &obs_counts;
+
+				// Entropy match
+				let donor_entropy = crate::stats::empirical_entropy(counts_ref, donor.scalar_count);
+				let stego_entropy = crate::stats::empirical_entropy(&obs_counts, indices.len());
+				let entropy_ok = (donor_entropy - stego_entropy).abs() < 1e-6;
+
+				let histogram_pass = exact_match && entropy_ok;
+
+				chunks.push(ChunkReport {
+					stego_name: stego_name.clone(),
+					donor_name: donor.name.clone(),
+					donor_dtype: donor.data_type,
+					ks_pass: histogram_pass, // K-S not applicable for discrete
+					ks_stat: 0.0,
+					ks_crit: 0.0,
+					chi2_pass: histogram_pass,
+					chi2_stat: 0.0,
+					chi2_crit: 0.0,
+					exact_histogram_match: histogram_pass,
+				});
+			}
+			_ => unreachable!(),
 		}
-
-		let chi2_stat = crate::stats::chi_squared_byte_test(&obs_freqs, &exp_freqs);
-		let chi2_pass = chi2_stat <= chi2_crit;
-
-		chunks.push(ChunkReport {
-			stego_name: stego_name.clone(),
-			donor_name: donor.name.clone(),
-			ks_pass,
-			ks_stat,
-			ks_crit,
-			chi2_pass,
-			chi2_stat,
-			chi2_crit,
-		});
 	}
 
 	let failed_chunks = chunks.iter().filter(|c| !c.ks_pass || !c.chi2_pass).count();
@@ -813,6 +887,7 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::proto::helpers::DT_FLOAT;
 
 	#[test]
 	fn test_name_generator_deterministic() {
@@ -894,8 +969,46 @@ mod tests {
 	}
 
 	#[test]
-	fn test_inject_extract_roundtrip() {
-		// Build a small model with one eligible FP32 tensor
+	fn test_natural_ratio_deterministic() {
+		let key = [0x42u8; 32];
+
+		// Build two identical donor pools
+		let donors_a = vec![
+			EligibleTensor {
+				name: "a".into(),
+				dims: vec![1024],
+				data_type: DT_FLOAT,
+				scalar_count: 1024,
+				sorted_values: (0..1024).map(|i| i as f32).collect(),
+				entropy: 0.0,
+				counts: None,
+			},
+			EligibleTensor {
+				name: "b".into(),
+				dims: vec![2048],
+				data_type: DT_FLOAT16,
+				scalar_count: 2048,
+				sorted_values: (0..2048).map(|i| i as f32).collect(),
+				entropy: 0.0,
+				counts: None,
+			},
+		];
+
+		let pools_a = build_pools(&donors_a);
+		let pools_b = build_pools(&donors_a); // identical data
+
+		let mut sel_a = DonorSelector::new(&key);
+		let mut sel_b = DonorSelector::new(&key);
+		let mut pa = pools_a;
+		let mut pb = pools_b;
+
+		let d1 = select_donor_natural(&mut sel_a, &mut pa);
+		let d2 = select_donor_natural(&mut sel_b, &mut pb);
+		assert_eq!(d1.name, d2.name, "Natural Ratio must be deterministic");
+	}
+
+	#[test]
+	fn test_inject_extract_roundtrip_fp32() {
 		let vals: Vec<f32> = (0..2048).map(|i| i as f32 * 0.001).collect();
 		let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
 		let tensor = crate::proto::TensorProto {
@@ -913,7 +1026,6 @@ mod tests {
 			..Default::default()
 		};
 
-		// Save to temp file
 		let dir = std::env::temp_dir();
 		let donor_path = dir.join("stnx_test_donor.onnx");
 		let stego_path = dir.join("stnx_test_stego.onnx");
@@ -922,35 +1034,27 @@ mod tests {
 
 		helpers::save_model(&model, &donor_path).unwrap();
 
-		// Encrypt a small payload
 		let payload = b"Hello, stego world!";
 		let passphrase = "test-passphrase-123";
 
 		let mut success = false;
 		for _ in 0..100 {
 			let stream = crate::crypto::encrypt(payload, "test.txt", passphrase, 3).unwrap();
-
-			// Inject (default dtype_bias = 0.5 for balanced mix)
-			if inject(&donor_path, &stream, passphrase, &stego_path, 0.70, 0.5).is_ok() {
+			if inject(&donor_path, &stream, passphrase, &stego_path, 0.70).is_ok() {
 				success = true;
 				break;
 			}
 		}
 		assert!(success, "injection failed after 100 attempts");
 
-		// Extract (must match injection dtype_bias)
-		let (recovered_data, recovered_name) = extract(&stego_path, passphrase, 0.5).unwrap();
+		let (recovered_data, recovered_name) = extract(&stego_path, passphrase).unwrap();
 		assert_eq!(
 			recovered_data,
 			payload.to_vec(),
-			"inject/extract roundtrip must recover original payload"
+			"roundtrip must recover payload"
 		);
-		assert_eq!(
-			recovered_name, "test.txt",
-			"recovered filename must match original"
-		);
+		assert_eq!(recovered_name, "test.txt");
 
-		// Cleanup
 		let _ = std::fs::remove_file(&donor_path);
 		let _ = std::fs::remove_file(&stego_path);
 	}
