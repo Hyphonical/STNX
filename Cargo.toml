@@ -33,7 +33,7 @@ rand_chacha = "0.10.0"
 zstd         = "0.13.3"
 
 # ── Serialization ──────────────────────────────────────────
-prost        = "0.14.3"
+prost        = "0.14.4"
 
 # ── Release Profile ────────────────────────────────────────
 [profile.release]
