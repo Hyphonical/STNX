@@ -23,7 +23,7 @@ owo-colors   = { version = "4", features = ["supports-colors"] }
 
 # ── Cryptography ───────────────────────────────────────────
 argon2       = "0.5.3"
-aes-gcm      = "0.10.3"
+aes-gcm      = "0.11.0"
 sha2         = "0.11.0"
 rand = { version = "0.10.1", features = ["std"] }
 chacha20 = "0.10.0"
